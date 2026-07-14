@@ -63,7 +63,8 @@ function boot(pluginPath) {
   nodePath = require('path'); nodeOs = require('os'); nodeFs = require('fs'); fileUrl = require('url');
   const base = pluginPath || nodePath.dirname(document.location.pathname.replace(/^\//, ''));
   backend = require(nodePath.join(base, 'js', 'backend.js'));
-  const cb = backend.cacheBase();   // ASCII, all-users-writable (avoids non-ASCII usernames)
+  backend.setBase(base);            // prefer an ASCII path next to the plugin, else C:\Users\Public
+  const cb = backend.cacheBase();
   cleanupTempDirs();                // start fresh; also clears anything left from a crash
   state.thumbDir = nodePath.join(cb, 'thumbs');
   state.previewDir = nodePath.join(cb, 'preview');

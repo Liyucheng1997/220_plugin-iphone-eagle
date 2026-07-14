@@ -14,20 +14,26 @@ const SCRIPT = path.join(__dirname, '..', 'scripts', 'iphone.ps1');
 // os.tmpdir() lives under the user profile, so a non-ASCII Windows username
 // (e.g. "魏培") produces a path that gets mangled when passed as a PowerShell
 // argument — which silently breaks thumbnails/preview/copy (but not listing).
-function pickCacheBase() {
-  const roots = [];
-  if (process.env.PUBLIC) roots.push(path.join(process.env.PUBLIC, 'eagle-iphone-sync'));       // C:\Users\Public
-  if (process.env.ProgramData) roots.push(path.join(process.env.ProgramData, 'eagle-iphone-sync'));
-  roots.push(path.join(os.tmpdir(), 'eagle-iphone-sync'));
-  for (const r of roots) {
-    // eslint-disable-next-line no-control-regex
-    if (/[^\x00-\x7F]/.test(r)) continue;   // skip any path that still contains non-ASCII
-    try { fs.mkdirSync(r, { recursive: true }); fs.accessSync(r, fs.constants.W_OK); return r; } catch (_) {}
-  }
-  try { fs.mkdirSync(path.join(os.tmpdir(), 'eagle-iphone-sync'), { recursive: true }); } catch (_) {}
-  return path.join(os.tmpdir(), 'eagle-iphone-sync');
+let CACHE_BASE = null;
+function tryDir(d) {
+  // eslint-disable-next-line no-control-regex
+  if (!d || /[^\x00-\x7F]/.test(d)) return null;   // must be pure ASCII
+  try { fs.mkdirSync(d, { recursive: true }); fs.accessSync(d, fs.constants.W_OK); return d; } catch (_) { return null; }
 }
-const CACHE_BASE = pickCacheBase();
+// Choose an ASCII, writable cache base. Prefer a folder next to the plugin
+// (per user request), then C:\Users\Public, then ProgramData, then tmpdir.
+function setBase(pluginPath) {
+  const cands = [];
+  if (pluginPath) cands.push(path.join(pluginPath, '.cache'));
+  if (process.env.PUBLIC) cands.push(path.join(process.env.PUBLIC, 'eagle-iphone-sync'));
+  if (process.env.ProgramData) cands.push(path.join(process.env.ProgramData, 'eagle-iphone-sync'));
+  cands.push(path.join(os.tmpdir(), 'eagle-iphone-sync'));
+  for (const c of cands) { const r = tryDir(c); if (r) { CACHE_BASE = r; return r; } }
+  CACHE_BASE = path.join(os.tmpdir(), 'eagle-iphone-sync');   // last resort
+  try { fs.mkdirSync(CACHE_BASE, { recursive: true }); } catch (_) {}
+  return CACHE_BASE;
+}
+function cacheBase() { if (!CACHE_BASE) setBase(null); return CACHE_BASE; }
 
 // onProgress(count) is called live as the backend prints "PROGRESS <n>" on stderr.
 // opts.idleMs: if set, abort when the backend produces no output for that long
@@ -111,7 +117,7 @@ function runAction(action, opts = {}, onProgress) {
 }
 
 function writeIdsFile(ids) {
-  const p = path.join(CACHE_BASE, 'ids_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.json');
+  const p = path.join(cacheBase(), 'ids_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.json');
   fs.writeFileSync(p, JSON.stringify(ids), 'utf8');
   return p;
 }
@@ -121,7 +127,8 @@ function cleanup(p) {
 }
 
 module.exports = {
-  cacheBase: () => CACHE_BASE,
+  setBase,
+  cacheBase,
 
   listDevices: () => runAction('devices'),
 

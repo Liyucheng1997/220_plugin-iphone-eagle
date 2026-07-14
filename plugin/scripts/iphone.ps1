@@ -582,13 +582,32 @@ public static class Wpd
     // Fetch the device-generated JPEG thumbnail for each object id (fast, ~50ms
     // each; HEIC photos also yield a JPEG thumbnail, so no HEIC decode needed).
     // Writes each to outPaths[i]. Returns how many succeeded.
+    // The thumbnail resource key varies by device/iOS version. Detect it from the
+    // object's supported resources (the non-DEFAULT one) instead of hardcoding a
+    // GUID that only matched one specific iPhone.
+    static PROPERTYKEY ResolveThumbKey(IPortableDeviceResources res, string[] oids){
+        PROPERTYKEY fb; fb.fmtid=RES_THUMBNAIL; fb.pid=0;
+        for(int i=0;i<oids.Length && i<8;i++){
+            if(string.IsNullOrEmpty(oids[i])) continue;
+            IPortableDeviceKeyCollection keys=null;
+            try { res.GetSupportedResources(oids[i], out keys); } catch { continue; }
+            try {
+                uint n=0; keys.GetCount(ref n);
+                for(uint j=0;j<n;j++){ PROPERTYKEY k; keys.GetAt(j, out k); if(k.fmtid != RES_DEFAULT_FMTID) return k; }
+                return fb;
+            } finally { try{ Marshal.FinalReleaseComObject(keys); }catch{} }
+        }
+        return fb;
+    }
+
     public static int SaveThumbnails(string deviceId, string[] oids, string[] outPaths){
         int ok=0;
         var dev = (IPortableDevice)CreateCom(CLSID_DeviceFTM);
         dev.Open(deviceId, MakeClientInfo());
         IPortableDeviceContent content; dev.Content(out content);
         IPortableDeviceResources res; content.Transfer(out res);
-        PROPERTYKEY key; key.fmtid=RES_THUMBNAIL; key.pid=0;
+        PROPERTYKEY key = ResolveThumbKey(res, oids);
+        Console.Error.WriteLine("THUMBKEY " + key.fmtid.ToString() + ":" + key.pid);
         for(int i=0;i<oids.Length;i++){
             try {
                 uint optimal=0; ComTypes.IStream stream;
