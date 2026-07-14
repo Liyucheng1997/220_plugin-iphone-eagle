@@ -1,11 +1,11 @@
 {
     "id": "iphone-photo-sync-eagle",
-    "version": "1.0.2",
+    "version": "1.1.0",
     "platform": "win",
     "arch": "all",
-    "name": "iPhone 照片同步",
+    "name": "手机照片同步",
     "logo": "logo.png",
-    "keywords": ["iphone", "ios", "photo", "import", "backup", "apple"],
+    "keywords": ["phone", "iphone", "ios", "android", "photo", "import", "backup", "apple", "mtp"],
     "devTools": false,
     "main": {
         "url": "index.html",

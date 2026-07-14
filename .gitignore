@@ -15,5 +15,8 @@ npm-debug.log*
 debug-*.ps1
 _*.html
 
+# Runtime thumbnail/preview cache (created next to the plugin on ASCII paths)
+.cache/
+
 # Eagle packaged plugin (built artifact; shipped via GitHub Releases)
 *.eagleplugin

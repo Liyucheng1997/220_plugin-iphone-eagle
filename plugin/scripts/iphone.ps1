@@ -1,10 +1,12 @@
 <#
-  iphone.ps1  --  iPhone/iPad photo backend for the Eagle plugin.
+  iphone.ps1  --  phone photo backend for the Eagle plugin (iPhone AND Android).
 
-  Talks to the connected Apple device through the Windows Shell (the same
-  mechanism File Explorer uses to show "Apple iPhone > Internal Storage >
-  DCIM"). No .NET SDK, no drivers beyond Apple's own USB driver (installed
-  with iTunes / "Apple Devices").
+  Talks to the connected phone through the Windows Portable Devices (WPD) /
+  MTP channel — the same one File Explorer uses to show "This PC > <phone> >
+  Internal Storage". Both iPhones and Android phones speak MTP, so the same
+  engine handles either. No .NET SDK required; iPhones use Apple's USB driver
+  (installed with iTunes / "Apple Devices"), Android uses the in-box Windows
+  MTP driver. (Filename kept as iphone.ps1 for backward compatibility.)
 
   All output on STDOUT is a single JSON object. Progress / errors go to STDERR
   so STDOUT stays clean JSON for Node to parse.
@@ -82,9 +84,10 @@ function Select-DeviceItem($shell, [string]$wanted) {
     if ($wanted -ne '') {
         foreach ($d in $devices) { if ($d.Name -eq $wanted) { return $d } }
     }
-    # Prefer an Apple device by name.
+    # Prefer a phone-like device by name (iPhone or a known Android brand).
+    $phoneRe = '(?i)iphone|ipad|ipod|apple|android|phone|galaxy|samsung|xiaomi|redmi|poco|huawei|honor|oppo|vivo|oneplus|pixel|google|moto|nokia|xperia|realme|asus|meizu|lenovo|tecno|infinix'
     foreach ($d in $devices) {
-        if ($d.Name -match '(?i)iphone|ipad|ipod|apple') { return $d }
+        if ($d.Name -match $phoneRe) { return $d }
     }
     # Otherwise the first portable device.
     return $devices[0]
@@ -142,6 +145,25 @@ function Get-ItemMeta($item) {
     return @{ size = $size; date = $dateStr; typeText = $typeText }
 }
 
+# Folder filtering, mirroring the WPD scan (see the C# AllowTopFolder/SkipFolder
+# comments): at a storage's top level only descend into real photo folders;
+# deeper down, prune cache/hidden junk. No-op for iPhone's clean layout.
+$script:PhotoTopFolders = @('dcim', 'pictures', 'picture', 'screenshots', 'screenshot',
+                            'download', 'downloads', 'movies', 'movie', 'video', 'videos',
+                            'camera', 'photo', 'photos', 'images', 'image', '100apple', '100andro')
+$script:SkipFolders = @('android', 'tencent', 'cache', 'caches', 'thumbnails',
+                        'log', 'logs', 'temp', 'tmp', 'netease', 'sina')
+function Should-AllowTopFolder([string]$name) {
+    if ([string]::IsNullOrEmpty($name)) { return $false }
+    if ($name -match '^\d{6}') { return $true }   # iPhone YYYYMM date folder (202506_a)
+    return ($script:PhotoTopFolders -contains $name.ToLowerInvariant())
+}
+function Should-SkipFolder([string]$name) {
+    if ([string]::IsNullOrEmpty($name)) { return $false }
+    if ($name[0] -eq '.') { return $true }   # hidden: .thumbnails, .Statuses, ...
+    return ($script:SkipFolders -contains $name.ToLowerInvariant())
+}
+
 # Recursively collect media files under DCIM. id = path relative to DCIM,
 # using '/' separators, e.g. "100APPLE/IMG_0001.HEIC".
 function Collect-Media($folder, [string]$prefix, [System.Collections.ArrayList]$acc, [int]$max) {
@@ -152,6 +174,8 @@ function Collect-Media($folder, [string]$prefix, [System.Collections.ArrayList]$
         if ($max -gt 0 -and $acc.Count -ge $max) { return }
         $name = $it.Name
         if ($it.IsFolder) {
+            if ($prefix -eq '') { if (-not (Should-AllowTopFolder $name)) { continue } }
+            elseif (Should-SkipFolder $name) { continue }
             $childPrefix = if ($prefix -eq '') { $name } else { "$prefix/$name" }
             $child = $null
             try { $child = $it.GetFolder } catch { $child = $null }
@@ -405,7 +429,9 @@ public static class Wpd
         void CreateObjectWithPropertiesAndData(IntPtr a, IntPtr b, IntPtr c, IntPtr d); // unused slot
         void Delete(uint dwOptions, IPortableDevicePropVariantCollection pObjectIDs, out IPortableDevicePropVariantCollection ppResults);
     }
-    [ComImport, Guid("89B2E422-4F1B-4316-BCEF-A44AFEA9DC19"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    // NOTE: correct IID is ...A44AFEA83EB3. An earlier ...A44AFEA9DC19 was WRONG,
+    // so the cast QI'd E_NOINTERFACE and delete never ran (silent failure).
+    [ComImport, Guid("89B2E422-4F1B-4316-BCEF-A44AFEA83EB3"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IPortableDevicePropVariantCollection {
         void GetCount(ref uint pcElems);
         void GetAt(uint index, out PROPVARIANT pValue);
@@ -478,20 +504,113 @@ public static class Wpd
         return (e==".heic"||e==".heif"||e==".jpg"||e==".jpeg"||e==".png"||e==".gif"||e==".dng"||e==".tiff"||e==".tif"||e==".bmp"||e==".webp");
     }
 
-    public static string FindAppleDeviceId(){
+    // On Android, MTP exposes the WHOLE storage, so a plain recursion picks up
+    // tens of thousands of CACHED images (thumbnail caches, WeChat/QQ/app image
+    // caches, ad/loading-pic junk that apps like DrCom/MIUI drop at the storage
+    // root) that are not the user's real photos. So at the TOP level of a storage
+    // we only descend into folders that actually hold photos (allowlist). Deeper
+    // down we additionally prune obvious cache/hidden folders (denylist).
+    //
+    // iPhone compatibility: its camera roll lives either in DCIM, or (as on this
+    // user's phone) in date-named folders like "202506_a" directly under the
+    // storage — so the top-level allowlist also passes any name that starts with
+    // 6 digits (YYYYMM). Do NOT remove that or iPhone stops listing.
+    static readonly string[] PhotoTopFolders = {
+        "dcim","pictures","picture","screenshots","screenshot","download",
+        "downloads","movies","movie","video","videos","camera","photo","photos",
+        "images","image","100apple","100andro"
+    };
+    static bool AllowTopFolder(string name){
+        if(string.IsNullOrEmpty(name)) return false;
+        if(name.Length>=6){
+            bool six=true;
+            for(int i=0;i<6;i++){ if(name[i]<'0'||name[i]>'9'){ six=false; break; } }
+            if(six) return true;   // iPhone YYYYMM date folder
+        }
+        string n=name.ToLowerInvariant();
+        foreach(var f in PhotoTopFolders) if(n==f) return true;
+        return false;
+    }
+    static readonly string[] SkipFolders = {
+        "android","tencent","cache","caches","thumbnails",
+        "log","logs","temp","tmp","netease","sina"
+    };
+    static bool SkipFolder(string name){
+        if(string.IsNullOrEmpty(name)) return false;
+        if(name[0]=='.') return true;   // hidden: .thumbnails, .face, .Statuses, .trashed ...
+        string n=name.ToLowerInvariant();
+        foreach(var s in SkipFolders) if(n==s) return true;
+        return false;
+    }
+
+    // A device (friendly name + manufacturer) looks like a phone we can sync —
+    // an iPhone/iPad, or any known Android brand. Used to auto-pick when the UI
+    // hasn't told us exactly which device, and to skip non-phone WPD devices
+    // (e.g. a USB SSD or card reader that also enumerates via WPD).
+    static readonly string[] PhoneHints = {
+        "apple","iphone","ipad","ipod","android","phone","galaxy","samsung",
+        "xiaomi","redmi","poco","huawei","honor","oppo","vivo","oneplus","pixel",
+        "google","moto","nokia","xperia","realme","asus","zte","meizu","lenovo",
+        "tecno","infinix","nothing"
+    };
+    static bool LooksLikePhone(string name, string mfr){
+        string s = ((name ?? "") + " " + (mfr ?? "")).ToLowerInvariant();
+        foreach(var h in PhoneHints) if(s.IndexOf(h, StringComparison.Ordinal) >= 0) return true;
+        return false;
+    }
+
+    // JSON list of every connected WPD/MTP device: [{name,desc,mfr,phone}].
+    // The UI shows these in the device dropdown and auto-selects a phone.
+    public static string ListDevicesJson(){
+        var mgr = (IPortableDeviceManager)CreateCom(CLSID_DeviceManager);
+        uint c=0; mgr.GetDevices(null, ref c);
+        var sb = new StringBuilder(); sb.Append('[');
+        if(c>0){
+            var ids = new string[c]; mgr.GetDevices(ids, ref c);
+            bool first=true;
+            for(int i=0;i<c;i++){
+                string id=ids[i];
+                string nm   = SbGet(s=>{ uint x=260; mgr.GetDeviceFriendlyName(id, s, ref x); });
+                string desc = SbGet(s=>{ uint x=260; mgr.GetDeviceDescription(id, s, ref x); });
+                string mfr  = SbGet(s=>{ uint x=260; mgr.GetDeviceManufacturer(id, s, ref x); });
+                if(string.IsNullOrEmpty(nm)) nm = !string.IsNullOrEmpty(desc) ? desc : id;
+                if(!first) sb.Append(','); first=false;
+                sb.Append("{\"name\":"); JsonEsc(sb, nm);
+                sb.Append(",\"desc\":"); JsonEsc(sb, desc);
+                sb.Append(",\"mfr\":");  JsonEsc(sb, mfr);
+                sb.Append(",\"phone\":"); sb.Append(LooksLikePhone(nm, mfr) ? "true" : "false");
+                sb.Append('}');
+            }
+        }
+        sb.Append(']');
+        return sb.ToString();
+    }
+
+    // Resolve the WPD device id to operate on. Preference order:
+    //  1) the device whose friendly name matches what the UI selected,
+    //  2) any phone-like device (iPhone or Android),
+    //  3) the first connected device.
+    public static string FindDeviceId(string wantedName){
         var mgr = (IPortableDeviceManager)CreateCom(CLSID_DeviceManager);
         uint c=0; mgr.GetDevices(null, ref c);
         if(c==0) return null;
         var ids = new string[c]; mgr.GetDevices(ids, ref c);
+        var names = new string[c]; var mfrs = new string[c];
         for(int i=0;i<c;i++){
             string id=ids[i];
-            string mfr = SbGet(sb=>{ uint x=260; mgr.GetDeviceManufacturer(id, sb, ref x); });
-            string nm  = SbGet(sb=>{ uint x=260; mgr.GetDeviceFriendlyName(id, sb, ref x); });
-            if(mfr.IndexOf("apple", StringComparison.OrdinalIgnoreCase)>=0) return id;
-            if(nm.IndexOf("iphone", StringComparison.OrdinalIgnoreCase)>=0) return id;
-            if(nm.IndexOf("ipad", StringComparison.OrdinalIgnoreCase)>=0) return id;
+            names[i] = SbGet(sb=>{ uint x=260; mgr.GetDeviceFriendlyName(id, sb, ref x); });
+            mfrs[i]  = SbGet(sb=>{ uint x=260; mgr.GetDeviceManufacturer(id, sb, ref x); });
         }
-        return null;
+        if(!string.IsNullOrEmpty(wantedName)){
+            for(int i=0;i<c;i++)
+                if(string.Equals(names[i], wantedName, StringComparison.OrdinalIgnoreCase)) return ids[i];
+            for(int i=0;i<c;i++)
+                if(!string.IsNullOrEmpty(names[i]) &&
+                   (names[i].IndexOf(wantedName, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    wantedName.IndexOf(names[i], StringComparison.OrdinalIgnoreCase) >= 0)) return ids[i];
+        }
+        for(int i=0;i<c;i++) if(LooksLikePhone(names[i], mfrs[i])) return ids[i];
+        return ids[0];
     }
 
     static IPortableDeviceValues MakeClientInfo(){
@@ -559,24 +678,78 @@ public static class Wpd
         return dt;
     }
 
-    // Delete objects from the device by object id (frees phone storage). Returns
-    // how many were requested (device performs the delete). VT_LPWSTR = 31.
-    public static int DeleteObjects(string deviceId, string[] oids){
+    // Does an object still exist on the device? (opens its own session.) Used to
+    // confirm a delete without re-enumerating the whole library.
+    public static bool ObjectExists(string deviceId, string oid){
+        try {
+            var dev = (IPortableDevice)CreateCom(CLSID_DeviceFTM);
+            dev.Open(deviceId, MakeClientInfo());
+            IPortableDeviceContent content; dev.Content(out content);
+            IPortableDeviceProperties props; content.Properties(out props);
+            var keys = (IPortableDeviceKeyCollection)CreateCom(CLSID_KeyCollection);
+            var k = WPD_OBJECT_NAME; keys.Add(ref k);
+            bool exists;
+            try {
+                IPortableDeviceValues v; props.GetValues(oid, keys, out v);
+                string nm=null; try { var kk=WPD_OBJECT_NAME; v.GetStringValue(ref kk, out nm); } catch {}
+                try { Marshal.FinalReleaseComObject(v); } catch {}
+                exists = (nm != null);
+            } catch { exists = false; }
+            try { Marshal.FinalReleaseComObject(dev); } catch {}
+            return exists;
+        } catch { return true; }   // can't tell → assume present (reports as not-deleted)
+    }
+
+    // Delete objects from the device by object id (frees phone storage). Returns a
+    // JSON array [{oid,hr,exists}] so the caller can tell, per object, the delete
+    // HRESULT AND whether it's actually gone (some devices return S_OK but keep the
+    // file, or refuse with an access-denied HRESULT). VT_LPWSTR = 31.
+    public static string DeleteObjectsDiag(string deviceId, string[] oids){
         var dev = (IPortableDevice)CreateCom(CLSID_DeviceFTM);
         dev.Open(deviceId, MakeClientInfo());
         IPortableDeviceContent content; dev.Content(out content);
+        IPortableDeviceProperties props; content.Properties(out props);
+        var nameKeys = (IPortableDeviceKeyCollection)CreateCom(CLSID_KeyCollection);
+        var kn = WPD_OBJECT_NAME; nameKeys.Add(ref kn);
+
         var coll = (IPortableDevicePropVariantCollection)CreateCom(CLSID_PropVariantCollection);
         foreach(var oid in oids){
-            PROPVARIANT pv; pv.vt=31; pv.p=Marshal.StringToCoTaskMemUni(oid);
+            PROPVARIANT pv = new PROPVARIANT(); pv.vt=31; pv.p=Marshal.StringToCoTaskMemUni(oid);
             coll.Add(ref pv);
             Marshal.FreeCoTaskMem(pv.p);
         }
-        IPortableDevicePropVariantCollection results;
-        content.Delete(0, coll, out results);   // 0 = no recursion
-        try { Marshal.FinalReleaseComObject(results); } catch {}
+        int[] hrs = new int[oids.Length];
+        try {
+            IPortableDevicePropVariantCollection results;
+            content.Delete(0, coll, out results);   // 0 = no recursion
+            try {
+                uint rc=0; results.GetCount(ref rc);
+                for(uint i=0;i<rc && i<oids.Length;i++){
+                    PROPVARIANT rv; results.GetAt(i, out rv);
+                    hrs[i] = (int)(rv.p.ToInt64() & 0xFFFFFFFF);   // VT_ERROR scode (best-effort)
+                }
+            } catch {}
+            try { Marshal.FinalReleaseComObject(results); } catch {}
+        } catch (Exception ex) { for(int i=0;i<hrs.Length;i++) hrs[i]=ex.HResult; }
         try { Marshal.FinalReleaseComObject(coll); } catch {}
+
+        var sb=new StringBuilder(); sb.Append('[');
+        for(int i=0;i<oids.Length;i++){
+            bool exists;
+            try {
+                IPortableDeviceValues v; props.GetValues(oids[i], nameKeys, out v);
+                string nm=null; try { var k=WPD_OBJECT_NAME; v.GetStringValue(ref k, out nm); } catch {}
+                try { Marshal.FinalReleaseComObject(v); } catch {}
+                exists = (nm != null);
+            } catch { exists = false; }
+            if(i>0) sb.Append(',');
+            sb.Append("{\"oid\":"); JsonEsc(sb, oids[i]);
+            sb.Append(",\"hr\":"); sb.Append(hrs[i]);
+            sb.Append(",\"exists\":"); sb.Append(exists?"true":"false"); sb.Append('}');
+        }
+        sb.Append(']');
         try { Marshal.FinalReleaseComObject(dev); } catch {}
-        return oids.Length;
+        return sb.ToString();
     }
 
     // Fetch the device-generated JPEG thumbnail for each object id (fast, ~50ms
@@ -644,7 +817,7 @@ public static class Wpd
         LastCount = _media;
 
         var outp = new StringBuilder(_sb.Length + 64);
-        outp.Append("{\"ok\":true,\"device\":"); JsonEsc(outp, deviceName ?? "Apple iPhone");
+        outp.Append("{\"ok\":true,\"device\":"); JsonEsc(outp, deviceName ?? "Phone");
         outp.Append(",\"count\":"); outp.Append(_media);
         outp.Append(",\"items\":"); outp.Append(_sb.ToString()); outp.Append('}');
         return outp.ToString();
@@ -673,6 +846,13 @@ public static class Wpd
 
                 bool container=(ct==CT_FOLDER || ct==CT_FUNCTIONAL);
                 if(container){
+                    // Never filter a whole storage (device-level child). At the
+                    // storage's top level, only descend into real photo folders;
+                    // deeper down, prune cache/hidden junk.
+                    if(!atDevice){
+                        if(prefix.Length==0){ if(!AllowTopFolder(nm)) continue; }
+                        else if(SkipFolder(nm)) continue;
+                    }
                     string np = atDevice ? "" : (prefix.Length==0 ? nm : prefix + "/" + nm);
                     Walk(content, props, keys, oid, np, false);
                 } else {
@@ -715,6 +895,23 @@ public static class Wpd
 switch ($Action) {
 
     'devices' {
+        # Prefer WPD enumeration: it returns the same friendly names + object ids
+        # the fast backend matches on, and it lists iPhone AND Android alike.
+        if (Ensure-WpdType) {
+            try {
+                $json = [Wpd]::ListDevicesJson()
+                # NOTE: ConvertFrom-Json '[]' yields $null in PS 5.1, and @($null)
+                # has Count 1 — so filter to real objects with a name before testing.
+                $arr = @(($json | ConvertFrom-Json) | Where-Object { $_ -and $_.name })
+                if ($arr.Count -gt 0) {
+                    $names = @()
+                    foreach ($d in $arr) { $names += @{ name = $d.name; mfr = $d.mfr; phone = [bool]$d.phone } }
+                    Emit @{ ok = $true; devices = @($names) }
+                    exit 0
+                }
+            } catch { Write-Log "wpd devices failed, shell fallback: $($_.Exception.Message)" }
+        }
+        # Fallback: Shell enumeration of "This PC" portable devices.
         $shell = Get-Shell
         $devices = Get-DeviceItems $shell
         $names = @()
@@ -767,11 +964,11 @@ switch ($Action) {
 
     'list' {
         # Fast path: WPD bulk enumeration (~2s for ~8k photos). Falls back to the
-        # Shell scan if WPD is unavailable or finds no Apple device.
-        $devName = if ($Device -ne '') { $Device } else { 'Apple iPhone' }
+        # Shell scan if WPD is unavailable or finds no phone.
+        $devName = if ($Device -ne '') { $Device } else { 'Phone' }
         if (Ensure-WpdType) {
             $devId = $null
-            try { $devId = [Wpd]::FindAppleDeviceId() } catch { Write-Log "wpd: find failed: $($_.Exception.Message)" }
+            try { $devId = [Wpd]::FindDeviceId($Device) } catch { Write-Log "wpd: find failed: $($_.Exception.Message)" }
             if ($devId) {
                 try {
                     Write-Log "fast scan via WPD..."
@@ -781,16 +978,16 @@ switch ($Action) {
                     exit 0
                 } catch { Write-Log "wpd: enumerate failed, falling back to Shell: $($_.Exception.Message)" }
             } else {
-                Write-Log "wpd: no Apple device via WPD, falling back to Shell"
+                Write-Log "wpd: no phone via WPD, falling back to Shell"
             }
         }
         # Fallback: Shell enumeration.
         $shell = Get-Shell
         $dev = Select-DeviceItem $shell $Device
-        if ($null -eq $dev) { Fail 'no Apple device found. Plug in your iPhone, unlock it, and tap "Trust".' }
+        if ($null -eq $dev) { Fail 'no phone found. Connect your phone and unlock it. iPhone: tap "Trust". Android: pull down the notification and set USB use to "File transfer / MTP".' }
         Write-Log "scanning device folders on '$($dev.Name)'..."
         $dcim = Get-PhotoRoot $dev.GetFolder
-        if ($null -eq $dcim) { Fail "device '$($dev.Name)' found but its storage is not accessible. Unlock the phone and tap Trust." }
+        if ($null -eq $dcim) { Fail "device '$($dev.Name)' found but its storage is not accessible. Unlock the phone (iPhone: tap Trust; Android: switch USB use to File transfer / MTP)." }
         $acc = New-Object System.Collections.ArrayList
         Collect-Media $dcim '' $acc $Max
         Write-Log "found $($acc.Count) media files"
@@ -803,9 +1000,9 @@ switch ($Action) {
         $ids = Read-Ids $InputFile
         $shell = Get-Shell
         $dev = Select-DeviceItem $shell $Device
-        if ($null -eq $dev) { Fail 'no Apple device found.' }
+        if ($null -eq $dev) { Fail 'no phone found.' }
         $dcim = Get-PhotoRoot $dev.GetFolder
-        if ($null -eq $dcim) { Fail 'DCIM not accessible.' }
+        if ($null -eq $dcim) { Fail 'phone storage not accessible.' }
         $results = @()
         foreach ($id in $ids) {
             $entry = @{ id = $id; size = $null; date = '' }
@@ -824,15 +1021,23 @@ switch ($Action) {
     }
 
     'thumb' {
-        # Fetch device-generated JPEG thumbnails via WPD by object id (fast).
-        # Input is a JSON array of { id, oid }. Output files named by id-hash.
+        # Thumbnails by object id. Input is a JSON array of { id, oid }.
+        # Phase 1 (fast): the device-provided WPD thumbnail (embedded JPEG). Camera
+        #   photos have one; it's ~50ms each and needs no decode.
+        # Phase 2 (fallback): many files have NO embedded thumbnail — PNG
+        #   screenshots, re-encoded/downloaded/chat JPEGs (WeChat etc.), and HEIC on
+        #   some devices. For those we transfer the full file and render a small
+        #   thumbnail locally via the Windows codec (same path 'preview' uses).
+        #   Video is skipped here (a full transfer just for a grid thumb is too
+        #   costly). Output files named by id-hash.
         if ($OutDir -eq '') { Fail 'thumb: -OutDir required' }
         New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+        $OutDir = [System.IO.Path]::GetFullPath($OutDir)   # ShellThumb needs absolute paths
         $items = Read-Ids $InputFile
         if (-not (Ensure-WpdType)) { Fail 'wpd engine unavailable' }
         $devId = $null
-        try { $devId = [Wpd]::FindAppleDeviceId() } catch {}
-        if (-not $devId) { Fail 'no Apple device (WPD).' }
+        try { $devId = [Wpd]::FindDeviceId($Device) } catch {}
+        if (-not $devId) { Fail 'no phone (WPD).' }
 
         $sha = New-Object Security.Cryptography.SHA1Managed
         $results = @()
@@ -842,18 +1047,36 @@ switch ($Action) {
             $id = $it.id; $oid = $it.oid
             $hash = [System.BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($id))).Replace('-', '').Substring(0, 16)
             $outPath = Join-Path $OutDir ("$hash.jpg")
-            $results += @{ id = $id; thumb = $null; _out = $outPath }
+            $results += @{ id = $id; oid = $oid; thumb = $null; _out = $outPath }
             if ((Test-Path -LiteralPath $outPath) -or -not $oid) { continue }
             [void]$fetchOids.Add($oid)
             [void]$fetchOuts.Add($outPath)
         }
+        # Phase 1: device-provided WPD thumbnails.
         if ($fetchOids.Count -gt 0) {
             try { [void][Wpd]::SaveThumbnails($devId, $fetchOids.ToArray(), $fetchOuts.ToArray()) }
             catch { Write-Log "wpd thumb failed: $($_.Exception.Message)" }
         }
+        # Phase 2: local render for whatever phase 1 couldn't produce.
+        $videoExt = @('.mov', '.mp4', '.m4v', '.avi')
+        $needRender = @($results | Where-Object { $_.oid -and -not (Test-Path -LiteralPath $_._out) })
+        if ($needRender.Count -gt 0 -and (Ensure-ThumbType)) {
+            foreach ($r in $needRender) {
+                $ext = ([System.IO.Path]::GetExtension($r.id)).ToLowerInvariant()
+                if ($videoExt -contains $ext) { continue }
+                Write-Log "RENDER $($r.id)"   # stderr heartbeat keeps the idle watchdog alive
+                $base = [System.IO.Path]::GetFileNameWithoutExtension($r._out)
+                $tmp = Join-Path $OutDir ("$base.orig$ext")
+                try {
+                    $n = [Wpd]::SaveResource($devId, $r.oid, $false, $tmp)
+                    if ($n -gt 0) { try { [void][ShellThumb]::Save($tmp, $Size, $r._out) } catch { Write-Log "render failed $($r.id): $($_.Exception.Message)" } }
+                } catch { Write-Log "transfer failed $($r.id): $($_.Exception.Message)" }
+                finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            }
+        }
         foreach ($r in $results) {
             if (Test-Path -LiteralPath $r._out) { $r.thumb = $r._out }
-            $r.Remove('_out')
+            $r.Remove('_out'); $r.Remove('oid')
         }
         Emit @{ ok = $true; results = @($results) }
         exit 0
@@ -869,8 +1092,8 @@ switch ($Action) {
         $items = Read-Ids $InputFile
         $it = @($items)[0]
         if (-not (Ensure-WpdType)) { Fail 'wpd unavailable' }
-        $devId = $null; try { $devId = [Wpd]::FindAppleDeviceId() } catch {}
-        if (-not $devId) { Fail 'no Apple device (WPD).' }
+        $devId = $null; try { $devId = [Wpd]::FindDeviceId($Device) } catch {}
+        if (-not $devId) { Fail 'no phone (WPD).' }
 
         $date = ''; try { $date = [Wpd]::GetDate($devId, $it.oid) } catch {}
         $sha = New-Object Security.Cryptography.SHA1Managed
@@ -914,8 +1137,8 @@ switch ($Action) {
         New-Item -ItemType Directory -Path $Dest -Force | Out-Null
         $items = Read-Ids $InputFile
         if (-not (Ensure-WpdType)) { Fail 'wpd unavailable' }
-        $devId = $null; try { $devId = [Wpd]::FindAppleDeviceId() } catch {}
-        if (-not $devId) { Fail 'no Apple device (WPD).' }
+        $devId = $null; try { $devId = [Wpd]::FindDeviceId($Device) } catch {}
+        if (-not $devId) { Fail 'no phone (WPD).' }
         $results = @()
         $i = 0
         foreach ($it in $items) {
@@ -942,28 +1165,38 @@ switch ($Action) {
     }
 
     'delete' {
-        # Delete objects from the phone via WPD (frees storage). Input [{id,oid}].
+        # Delete objects from the phone to free storage. Input [{id,oid}].
+        # WPD delete (fast, batch) with per-object HRESULT + existence check. No
+        # full re-enumeration (that cost ~90s on a big library); existence is
+        # confirmed per object. On failure the HRESULT is surfaced so we can tell a
+        # device that refuses deletion (e.g. iPhone: iOS blocks MTP delete of the
+        # camera roll) from something fixable.
         $items = Read-Ids $InputFile
         if (-not (Ensure-WpdType)) { Fail 'wpd unavailable' }
-        $devId = $null; try { $devId = [Wpd]::FindAppleDeviceId() } catch {}
-        if (-not $devId) { Fail 'no Apple device (WPD).' }
-        $oids = @(); $map = @{}
-        foreach ($it in $items) { if ($it.oid) { $oids += $it.oid; $map[$it.oid] = $it.id } }
-        $results = @()
+        $devId = $null; try { $devId = [Wpd]::FindDeviceId($Device) } catch {}
+        if (-not $devId) { Fail 'no phone (WPD).' }
+        $oids = @(); foreach ($it in $items) { if ($it.oid) { $oids += $it.oid } }
+
+        $diag = @{}
         if ($oids.Count -gt 0) {
-            try { [void][Wpd]::DeleteObjects($devId, $oids) }
-            catch { Write-Log "wpd delete failed: $($_.Exception.Message)" }
+            try {
+                $diagJson = [Wpd]::DeleteObjectsDiag($devId, $oids)
+                foreach ($d in @($diagJson | ConvertFrom-Json)) { $diag[$d.oid] = $d }
+            } catch { Write-Log "wpd delete failed: $($_.Exception.Message)" }
         }
-        # Confirm by re-enumerating remaining oids.
-        $remaining = @{}
-        try {
-            $json = [Wpd]::ListResultJson($devId, 'Apple iPhone', 0)
-            $parsed = $json | ConvertFrom-Json
-            foreach ($m in $parsed.items) { $remaining[$m.oid] = $true }
-        } catch {}
+
+        # Report per-item, using the (authoritative) existence check.
+        $results = @()
         foreach ($it in $items) {
-            $gone = -not $remaining.ContainsKey($it.oid)
-            $results += @{ id = $it.id; ok = $gone; error = if ($gone) { $null } else { 'still present' } }
+            if (-not $it.oid) { $results += @{ id = $it.id; ok = $false; error = 'no object id' }; continue }
+            $d = $diag[$it.oid]
+            $gone = ($null -ne $d) -and (-not $d.exists)
+            if ($gone) {
+                $results += @{ id = $it.id; ok = $true; error = $null }
+            } else {
+                $hrHex = if ($d -and $d.hr) { ('0x{0:X8}' -f ([int64]$d.hr -band 0xFFFFFFFF)) } else { '?' }
+                $results += @{ id = $it.id; ok = $false; error = "设备拒绝删除 (HRESULT $hrHex)" }
+            }
         }
         Emit @{ ok = $true; results = @($results) }
         exit 0

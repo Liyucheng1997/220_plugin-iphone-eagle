@@ -1,7 +1,8 @@
 /*
- * backend.js — Node bridge between the Eagle plugin UI and iphone.ps1.
- * Spawns PowerShell, passes item ids through temp JSON files, parses the
- * single JSON object the script prints on stdout.
+ * backend.js — Node bridge between the Eagle plugin UI and the phone backend
+ * (scripts/iphone.ps1 — handles iPhone AND Android over WPD/MTP; filename kept
+ * for backward compatibility). Spawns PowerShell, passes item ids through temp
+ * JSON files, parses the single JSON object the script prints on stdout.
  */
 const { spawn } = require('child_process');
 const path = require('path');
@@ -169,7 +170,7 @@ module.exports = {
   // Delete from the device. items: [{id, oid}]. Returns { ok, results:[{id,ok,error}] }
   remove: (device, items) => {
     const inputFile = writeIdsFile(items);
-    return runAction('delete', { device, inputFile })
+    return runAction('delete', { device, inputFile, idleMs: 40000 })
       .finally(() => cleanup(inputFile));
   },
 };

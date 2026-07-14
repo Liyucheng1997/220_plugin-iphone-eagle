@@ -1,6 +1,8 @@
-/* app.js — iPhone Photo Sync (Eagle plugin): virtualized grid + viewer. */
+/* app.js — Phone Photo Sync (Eagle plugin, iPhone + Android): virtualized grid + viewer. */
 
 let backend = null, nodePath = null, nodeOs = null, nodeFs = null, fileUrl = null;
+
+const SYNC_TAG = '手机照片';  // Eagle tag applied to every imported photo/video.
 
 let TILE = 150;                 // tile size in px (adjustable via zoom bar)
 const GAP = 10, PAD = 12, HEADER_H = 34, SECTION_GAP = 6;
@@ -16,6 +18,7 @@ function setTileSize(px) {
 
 let state = {
   device: '',
+  loading: false,               // guards against overlapping device reads (MTP is single-accessor)
   items: [], view: [],
   selected: new Set(), focused: null, lastClickedIndex: null, filterKind: 'all',
   thumbDir: '', previewDir: '',
@@ -136,12 +139,15 @@ async function detectAndLoad() {
     const sel = $('deviceSelect'); sel.innerHTML = '';
     if (devices.length === 0) {
       state.device = ''; state.items = []; applyView();
-      showEmpty('未检测到设备。用数据线连接 iPhone，在手机上点“信任此电脑”，然后点“刷新”。');
+      showEmpty('未检测到手机。用数据线连接手机后点“刷新”。iPhone：在手机上点“信任此电脑”；安卓：下拉通知栏，把 USB 用途改为“传输文件 / MTP”（默认“仅充电”读不到照片）。');
       setStatus('无设备', true); return;
     }
     devices.forEach((d) => { const o = document.createElement('option'); o.value = d.name; o.textContent = d.name; sel.appendChild(o); });
-    const apple = devices.find((d) => /iphone|ipad|ipod|apple/i.test(d.name));
-    state.device = apple ? apple.name : devices[0].name;
+    // Auto-select a phone: the backend flags phone-like devices; fall back to a
+    // name match (iPhone or a known Android brand), else the first device.
+    const brandRe = /iphone|ipad|ipod|apple|android|phone|galaxy|samsung|xiaomi|redmi|poco|huawei|honor|oppo|vivo|oneplus|pixel|google|moto|nokia|xperia|realme|asus|meizu|lenovo|tecno|infinix|nothing/i;
+    const phone = devices.find((d) => d.phone) || devices.find((d) => brandRe.test(d.name || '') || brandRe.test(d.mfr || ''));
+    state.device = phone ? phone.name : devices[0].name;
     sel.value = state.device;
     await loadPhotos();
   } catch (e) { setStatus('检测失败：' + e.message, true); showEmpty('检测设备出错：' + e.message); }
@@ -149,6 +155,12 @@ async function detectAndLoad() {
 
 async function loadPhotos() {
   if (!state.device) return;
+  // MTP allows only ONE accessor at a time. Never let two reads (e.g. a double
+  // "刷新") overlap, and serialize the read behind any in-flight thumb/preview/
+  // delete via deviceOp — otherwise the concurrent WPD sessions deadlock and the
+  // read hangs until the cable is replugged.
+  if (state.loading) return;
+  state.loading = true;
   setBusy(true); setStatus(`正在读取「${state.device}」的照片…`); showEmpty('正在快速读取照片列表…'); showProgress(null);
   try {
     const onProgress = (n) => {
@@ -156,19 +168,20 @@ async function loadPhotos() {
       setStatus(`「${state.device}」${msg}`);
       const p = document.querySelector('.empty p'); if (p) p.textContent = msg;
     };
-    const res = await backend.listPhotos(state.device, 0, onProgress);
+    const res = await deviceOp(() => backend.listPhotos(state.device, 0, onProgress));
     if (!res.ok) { setStatus('读取失败：' + res.error, true); showEmpty(res.error); return; }
     state.items = res.items || [];
     state.selected.clear(); state.lastClickedIndex = null;
     state.thumbCache.clear(); state.thumbReq.clear(); state.previewCache.clear();
+    thumbFailed.clear();   // a reload/refresh must retry thumbs (earlier failures may be stale)
     setStatus(`「${state.device}」共 ${state.items.length} 张照片/视频`);
     applyView();
   } catch (e) {
     if (e && e.code === 'IDLE_TIMEOUT') {
       setStatus('读取超时：设备无响应', true);
-      showEmpty('读取卡住了——手机存储没有响应。请：拔插数据线、保持 iPhone 解锁（设置→显示与亮度→自动锁定→永不）、关掉占用手机的其它程序，然后点“刷新”。');
+      showEmpty('读取卡住了——手机存储没有响应。请：拔插数据线、保持手机解锁（iPhone：设置→显示与亮度→自动锁定→永不；安卓：确认 USB 用途是“传输文件 / MTP”）、关掉占用手机的其它程序，然后点“刷新”。');
     } else { setStatus('读取失败：' + e.message, true); showEmpty('读取照片出错：' + e.message); }
-  } finally { hideProgress(); setBusy(false); }
+  } finally { hideProgress(); setBusy(false); state.loading = false; }
 }
 
 // ---------------------------------------------------------------
@@ -195,11 +208,16 @@ function applyView() {
 }
 
 // ---------------------------------------------------------------
-// Virtualized grid with month sections (grouped by folder = YYYYMM)
+// Virtualized grid with month sections. iPhone folders are YYYYMM (e.g.
+// 202506_a), so grouping is free from the folder name. Android puts everything
+// under Camera/Screenshots/etc, so we fall back to a date embedded in the
+// filename (IMG_20250131_..., PXL_20250131..., Screenshot_2025-01-31-...).
 // ---------------------------------------------------------------
 function monthOf(it) {
-  const m = /^(\d{4})(\d{2})/.exec(it.folder || '');
-  if (m) return { key: m[1] + m[2], label: `${m[1]}年${+m[2]}月` };
+  const f = /^(\d{4})(0[1-9]|1[0-2])/.exec(it.folder || '');
+  if (f) return { key: f[1] + f[2], label: `${f[1]}年${+f[2]}月` };
+  const n = /(20\d{2})[-_]?(0[1-9]|1[0-2])[-_]?[0-3]\d/.exec(it.name || '');
+  if (n) return { key: n[1] + n[2], label: `${n[1]}年${+n[2]}月` };
   return { key: '000000', label: '未知日期' };
 }
 
@@ -274,7 +292,10 @@ function makeTile(index) {
   const it = state.view[index];
   const el = document.createElement('div');
   el.className = 'tile' + (state.selected.has(it.id) ? ' selected' : '') + (state.focused === it.id ? ' focused' : '');
-  el.dataset.id = it.id; el.dataset.index = index;
+  // dataset.oid is REQUIRED: flushThumbs reads it to fetch the WPD thumbnail.
+  // Without it every thumb request carries an empty oid and the backend skips
+  // it, so no thumbnails are ever produced (blank tiles).
+  el.dataset.id = it.id; el.dataset.index = index; el.dataset.oid = it.oid || '';
   const p = state.itemPos[index] || { x: PAD, y: PAD };
   el.style.left = p.x + 'px'; el.style.top = p.y + 'px';
 
@@ -354,11 +375,16 @@ async function flushThumbs() {
   // Collect currently-rendered tiles (top-to-bottom) that still need a thumbnail.
   const pending = [];
   const entries = Array.from(state.renderedTiles.entries()).sort((a, b) => a[0] - b[0]);
-  for (const [, el] of entries) {
+  for (const [idx, el] of entries) {
     const id = el.dataset.id;
     if (state.thumbCache.has(id) || state.thumbReq.has(id) || thumbFailed.has(id)) continue;
     if (!el.querySelector('.placeholder')) continue;
-    pending.push({ id, oid: el.dataset.oid });
+    // oid comes from the item (robust); dataset.oid is a fallback. A missing oid
+    // makes the backend skip the item, so never send an empty one.
+    const it = state.view[idx];
+    const oid = (it && it.oid) || el.dataset.oid;
+    if (!oid) continue;
+    pending.push({ id, oid });
     if (pending.length >= THUMB_BATCH) break;
   }
   if (pending.length === 0) return;
@@ -465,7 +491,7 @@ async function importItems(items, { offerDelete = false, folderId = '' } = {}) {
           try {
             await eagle.item.addFromPath(r.path, {
               name: stripExt(r.name || nodePath.basename(r.path)),
-              tags: ['iPhone'], folders: folderId ? [folderId] : [], annotation: '来自 iPhone：' + r.id,
+              tags: [SYNC_TAG], folders: folderId ? [folderId] : [], annotation: `来自手机「${state.device}」：` + r.id,
             });
             imported++; importedSet.add(r.id); okIds.push(r.id);
           } catch (e) { failed++; }
@@ -480,7 +506,7 @@ async function importItems(items, { offerDelete = false, folderId = '' } = {}) {
   if (offerDelete && okIds.length > 0) {
     const resp = await showConfirm({
       title: '导入完成', message: `已成功导入 ${okIds.length} 张到 Eagle。`,
-      detail: '是否从 iPhone 删除这些已导入的照片以释放空间？此操作不可撤销。', buttons: ['保留在手机', '从手机删除'], danger: true,
+      detail: '是否从手机删除这些已导入的照片以释放空间？此操作不可撤销。', buttons: ['保留在手机', '从手机删除'], danger: true,
     });
     if (resp === 1) await removeItems(state.items.filter((it) => okIds.includes(it.id)).map(pick), true);
   }
@@ -548,21 +574,27 @@ async function removeItems(items, confirmed) {
   if (!items.length) return;
   if (!confirmed) {
     const resp = await showConfirm({
-      title: '确认删除', message: `确定要从 iPhone 删除选中的 ${items.length} 张照片/视频吗？`,
+      title: '确认删除', message: `确定要从手机删除选中的 ${items.length} 张照片/视频吗？`,
       detail: '此操作会直接从手机相机胶卷删除，且不可撤销。建议先备份或导入。', buttons: ['取消', '删除'], danger: true,
     });
     if (resp !== 1) return;
   }
   setBusy(true); showProgress(null); setStatus(`正在从手机删除 ${items.length} 项…`);
-  let ok = 0, failed = 0;
+  let ok = 0, failed = 0; let firstErr = '';
   try {
     const res = await deviceOp(() => backend.remove(state.device, items));
-    for (const r of (res.results || [])) { if (r.ok) { ok++; removeItemFromState(r.id); } else failed++; }
+    for (const r of (res.results || [])) {
+      if (r.ok) { ok++; removeItemFromState(r.id); }
+      else { failed++; if (!firstErr && r.error) firstErr = r.error; }
+    }
   } catch (e) { setStatus('删除出错：' + e.message, true); }
   finally { hideProgress(); setBusy(false); }
   state.selected.clear(); applyView();
   setStatus(`删除完成：成功 ${ok}${failed ? `，失败 ${failed}` : ''}`);
-  if (failed > 0) await showInfo('部分删除失败', `${failed} 个文件删除失败。`, '可重试，或在手机上手动删除。');
+  if (failed > 0) {
+    await showInfo('部分删除失败', `${failed} 个文件删除失败。`,
+      (firstErr ? ('原因：' + firstErr + '\n') : '') + '可重试，或在手机上手动删除。');
+  }
 }
 function removeItemFromState(id) {
   const i = state.items.findIndex((x) => x.id === id); if (i >= 0) state.items.splice(i, 1);
@@ -639,7 +671,7 @@ async function onTileDragStart(index, e) {
   try {
     const paths = await transferOriginalsForDrag(items);
     if (paths.length) { setStatus(`拖拽 ${paths.length} 个原图到 Eagle`); await eagle.drag.startDrag(paths); }
-    else setStatus('原图准备失败（可能在 iCloud 未下载到本机）', true);
+    else setStatus('原图准备失败（iPhone 可能在 iCloud 未下载到本机；或文件已被移动）', true);
   } catch (err) { setStatus('准备原图出错：' + (err && err.message), true); }
 }
 
@@ -716,7 +748,7 @@ async function viewerAdd() {
     const r = res.results && res.results[0];
     if (r && r.ok && r.path) {
       // Import to the library root (unclassified); the user files it by dragging.
-      await eagle.item.addFromPath(r.path, { name: stripExt(it.name), tags: ['iPhone'], folders: [], annotation: '来自 iPhone：' + it.id });
+      await eagle.item.addFromPath(r.path, { name: stripExt(it.name), tags: [SYNC_TAG], folders: [], annotation: `来自手机「${state.device}」：` + it.id });
       markImported(it.id);
       try { nodeFs.unlinkSync(r.path); } catch (_) {}
       viewerToast('已添加到 Eagle（未分类）');
@@ -729,21 +761,21 @@ async function viewerAdd() {
 async function viewerDelete() {
   const it = state.view[state.viewerIndex]; if (!it) return;
   const resp = await showConfirm({
-    title: '从手机删除', message: '确定从 iPhone 删除这张照片吗？',
+    title: '从手机删除', message: '确定从手机删除这张照片吗？',
     detail: it.name + '\n删除后无法恢复，会释放手机空间。', buttons: ['取消', '删除'], danger: true,
   });
   if (resp !== 1) return;
   $('viewerDelete').disabled = true;
   try {
     const res = await deviceOp(() => backend.remove(state.device, [pick(it)]));
-    const ok = res.results && res.results[0] && res.results[0].ok;
-    if (ok) {
+    const r0 = res.results && res.results[0];
+    if (r0 && r0.ok) {
       const idx = state.viewerIndex;
       removeItemFromState(it.id); applyView();
       if (state.view.length === 0) { closeViewer(); return; }
       openViewer(Math.min(idx, state.view.length - 1));
       viewerToast('已从手机删除');
-    } else viewerToast('删除失败');
+    } else viewerToast('删除失败' + (r0 && r0.error ? '：' + r0.error : ''));
   } catch (e) { viewerToast('删除出错：' + e.message); }
   finally { $('viewerDelete').disabled = false; }
 }
