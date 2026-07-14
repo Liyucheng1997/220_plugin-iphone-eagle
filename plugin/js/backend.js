@@ -10,6 +10,25 @@ const os = require('os');
 
 const SCRIPT = path.join(__dirname, '..', 'scripts', 'iphone.ps1');
 
+// All temp files/dirs must live under an ASCII, all-users-writable path.
+// os.tmpdir() lives under the user profile, so a non-ASCII Windows username
+// (e.g. "魏培") produces a path that gets mangled when passed as a PowerShell
+// argument — which silently breaks thumbnails/preview/copy (but not listing).
+function pickCacheBase() {
+  const roots = [];
+  if (process.env.PUBLIC) roots.push(path.join(process.env.PUBLIC, 'eagle-iphone-sync'));       // C:\Users\Public
+  if (process.env.ProgramData) roots.push(path.join(process.env.ProgramData, 'eagle-iphone-sync'));
+  roots.push(path.join(os.tmpdir(), 'eagle-iphone-sync'));
+  for (const r of roots) {
+    // eslint-disable-next-line no-control-regex
+    if (/[^\x00-\x7F]/.test(r)) continue;   // skip any path that still contains non-ASCII
+    try { fs.mkdirSync(r, { recursive: true }); fs.accessSync(r, fs.constants.W_OK); return r; } catch (_) {}
+  }
+  try { fs.mkdirSync(path.join(os.tmpdir(), 'eagle-iphone-sync'), { recursive: true }); } catch (_) {}
+  return path.join(os.tmpdir(), 'eagle-iphone-sync');
+}
+const CACHE_BASE = pickCacheBase();
+
 // onProgress(count) is called live as the backend prints "PROGRESS <n>" on stderr.
 // opts.idleMs: if set, abort when the backend produces no output for that long
 // (a wedged/locked device blocks silently — better to fail with advice than hang).
@@ -92,7 +111,7 @@ function runAction(action, opts = {}, onProgress) {
 }
 
 function writeIdsFile(ids) {
-  const p = path.join(os.tmpdir(), 'eagle_iphone_ids_' + Date.now() + '.json');
+  const p = path.join(CACHE_BASE, 'ids_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.json');
   fs.writeFileSync(p, JSON.stringify(ids), 'utf8');
   return p;
 }
@@ -102,6 +121,8 @@ function cleanup(p) {
 }
 
 module.exports = {
+  cacheBase: () => CACHE_BASE,
+
   listDevices: () => runAction('devices'),
 
   diagnose: (device) => runAction('diagnose', { device }),

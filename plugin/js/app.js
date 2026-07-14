@@ -48,13 +48,13 @@ function rmDir(p) {
 // Remove all of the plugin's temp caches (thumbnails, previews, drag originals,
 // import staging). Called on startup (clears crash leftovers) and on close.
 function cleanupTempDirs() {
-  if (!nodeOs) return;
-  const base = nodeOs.tmpdir();
-  ['eagle_iphone_thumbs', 'eagle_iphone_preview', 'eagle_iphone_drag'].forEach((d) => rmDir(nodePath.join(base, d)));
+  if (!nodeOs || !backend) return;
+  const base = backend.cacheBase();
+  ['thumbs', 'preview', 'drag'].forEach((d) => rmDir(nodePath.join(base, d)));
   try {
     nodeFs.readdirSync(base).forEach((name) => {
-      if (/^eagle_iphone_(import|one)_/.test(name)) rmDir(nodePath.join(base, name));
-      if (/^eagle_iphone_ids_.*\.json$/.test(name)) { try { nodeFs.unlinkSync(nodePath.join(base, name)); } catch (_) {} }
+      if (/^(import|one)_/.test(name)) rmDir(nodePath.join(base, name));
+      if (/^ids_.*\.json$/.test(name)) { try { nodeFs.unlinkSync(nodePath.join(base, name)); } catch (_) {} }
     });
   } catch (_) {}
 }
@@ -63,9 +63,10 @@ function boot(pluginPath) {
   nodePath = require('path'); nodeOs = require('os'); nodeFs = require('fs'); fileUrl = require('url');
   const base = pluginPath || nodePath.dirname(document.location.pathname.replace(/^\//, ''));
   backend = require(nodePath.join(base, 'js', 'backend.js'));
-  cleanupTempDirs();   // start fresh; also clears anything left from a crash
-  state.thumbDir = nodePath.join(nodeOs.tmpdir(), 'eagle_iphone_thumbs');
-  state.previewDir = nodePath.join(nodeOs.tmpdir(), 'eagle_iphone_preview');
+  const cb = backend.cacheBase();   // ASCII, all-users-writable (avoids non-ASCII usernames)
+  cleanupTempDirs();                // start fresh; also clears anything left from a crash
+  state.thumbDir = nodePath.join(cb, 'thumbs');
+  state.previewDir = nodePath.join(cb, 'preview');
   try { nodeFs.mkdirSync(state.thumbDir, { recursive: true }); } catch (_) {}
   try { nodeFs.mkdirSync(state.previewDir, { recursive: true }); } catch (_) {}
   wireEvents();
@@ -447,7 +448,7 @@ async function ensureListed() { if (state.items.length) return true; await loadP
 // ---------------------------------------------------------------
 async function importItems(items, { offerDelete = false, folderId = '' } = {}) {
   if (!items || items.length === 0) { setStatus('没有需要导入的照片'); return { imported: 0, failed: 0 }; }
-  const tempDir = nodePath.join(nodeOs.tmpdir(), 'eagle_iphone_import_' + Date.now());
+  const tempDir = nodePath.join(backend.cacheBase(), 'import_' + Date.now());
   nodeFs.mkdirSync(tempDir, { recursive: true });
   const importedSet = loadImported(state.device);
   const okIds = [];
@@ -615,7 +616,7 @@ function queuedPreview(item) { return deviceOp(() => backend.preview(state.devic
 // --- Drag-to-Eagle: hand Eagle the ORIGINAL file, not the thumbnail. ---
 const dragCache = new Map();  // id -> local original path
 async function transferOriginalsForDrag(items) {
-  const dir = nodePath.join(nodeOs.tmpdir(), 'eagle_iphone_drag');
+  const dir = nodePath.join(backend.cacheBase(), 'drag');
   try { nodeFs.mkdirSync(dir, { recursive: true }); } catch (_) {}
   const paths = [], toFetch = [];
   for (const it of items) {
@@ -708,7 +709,7 @@ async function viewerAdd() {
   const it = state.view[state.viewerIndex]; if (!it) return;
   $('viewerAdd').disabled = true;
   try {
-    const tempDir = nodePath.join(nodeOs.tmpdir(), 'eagle_iphone_one_' + Date.now());
+    const tempDir = nodePath.join(backend.cacheBase(), 'one_' + Date.now());
     nodeFs.mkdirSync(tempDir, { recursive: true });
     const res = await deviceOp(() => backend.copy(state.device, [pick(it)], tempDir));
     const r = res.results && res.results[0];
