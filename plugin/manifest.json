@@ -1,0 +1,25 @@
+{
+    "id": "iphone-photo-sync-eagle",
+    "version": "1.0.0",
+    "platform": "win",
+    "arch": "all",
+    "name": "iPhone 照片同步",
+    "logo": "logo.png",
+    "keywords": ["iphone", "ios", "photo", "import", "backup", "apple"],
+    "devTools": false,
+    "main": {
+        "url": "index.html",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 820,
+        "minHeight": 560,
+        "alwaysOnTop": false,
+        "frame": true,
+        "resizable": true,
+        "maximizable": true,
+        "minimizable": true,
+        "backgroundColor": "#1e1f22",
+        "multiple": false,
+        "runAfterInstall": false
+    }
+}

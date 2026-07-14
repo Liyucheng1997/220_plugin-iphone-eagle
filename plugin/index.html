@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>iPhone 照片同步</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <header class="toolbar">
+        <div class="toolbar-left">
+            <select id="deviceSelect" title="选择设备"></select>
+            <button id="refreshBtn" class="btn">刷新</button>
+            <span id="status" class="status">正在检测设备…</span>
+        </div>
+        <div class="toolbar-right">
+            <div class="segmented" id="filterSeg">
+                <button type="button" class="seg active" data-kind="all">全部</button>
+                <button type="button" class="seg" data-kind="image">图片</button>
+                <button type="button" class="seg" data-kind="video">视频</button>
+            </div>
+            <select id="sortBy" class="pill-select" title="排序方式">
+                <option value="order-desc">拍摄顺序（新→旧）</option>
+                <option value="order-asc">拍摄顺序（旧→新）</option>
+                <option value="name-asc">文件名</option>
+            </select>
+        </div>
+    </header>
+
+    <section class="actionbar">
+        <label class="chk"><input type="checkbox" id="selectAll"> 全选</label>
+        <span id="selCount" class="selcount">已选 0 项</span>
+        <div class="spacer"></div>
+        <button id="importBtn" class="btn btn-primary" disabled>导入所选</button>
+        <button id="deleteBtn" class="btn btn-danger" disabled>删除所选…</button>
+    </section>
+
+    <main id="grid" class="grid">
+        <div id="gridInner"></div>
+        <div id="emptyState" class="empty">
+            <div class="empty-icon">📱</div>
+            <p id="emptyText">用数据线连接 iPhone，在手机上点“信任”，然后点“刷新”。</p>
+        </div>
+    </main>
+
+    <footer class="footer">
+        <span id="footerInfo"></span>
+        <progress id="progress" max="100" value="0" style="display:none"></progress>
+        <div class="zoombar">
+            <button id="zoomOut" class="zbtn" title="缩小缩略图">−</button>
+            <input id="zoomRange" type="range" min="90" max="260" step="10" value="150" title="缩略图大小">
+            <button id="zoomIn" class="zbtn" title="放大缩略图">+</button>
+        </div>
+    </footer>
+
+    <!-- Hover preview (Eagle-style, bottom-right) -->
+    <div id="hoverPreview" class="hover-preview" style="display:none">
+        <img id="hoverImg" alt="">
+        <div id="hoverName" class="hover-name"></div>
+    </div>
+
+    <!-- Full-screen photo viewer -->
+    <div id="viewer" class="viewer" style="display:none">
+        <div class="viewer-topbar">
+            <span id="viewerTitle" class="viewer-title"></span>
+            <div class="viewer-actions">
+                <button id="viewerAdd" class="btn btn-primary">添加到未分类</button>
+                <button id="viewerDelete" class="btn btn-danger">从手机删除</button>
+                <button id="viewerClose" class="btn" title="关闭 (Esc)">✕</button>
+            </div>
+        </div>
+        <button id="viewerPrev" class="viewer-nav prev" title="上一张 (←)">‹</button>
+        <div id="viewerStage" class="viewer-stage">
+            <img id="viewerImg" class="viewer-img" alt="" draggable="false">
+            <video id="viewerVideo" class="viewer-img" controls playsinline draggable="false" style="display:none"></video>
+            <div id="viewerMsg" class="viewer-msg"></div>
+        </div>
+        <button id="viewerNext" class="viewer-nav next" title="下一张 (→)">›</button>
+        <div id="viewerCounter" class="viewer-counter"></div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Node (not used by the plugin, but just in case)
+node_modules/
+npm-debug.log*
+
+# Local debug / temp
+*.log
+debug-*.ps1
+_*.html
+
+# Eagle packaged plugin (built artifact; shipped via GitHub Releases)
+*.eagleplugin
