@@ -1,5 +1,13 @@
-<#
+﻿<#
   iphone.ps1  --  phone photo backend for the Eagle plugin (iPhone AND Android).
+
+  ENCODING: this file MUST stay UTF-8 *with BOM*. It contains Chinese strings,
+  and PowerShell 5.1 decodes a BOM-less .ps1 using the system ANSI codepage —
+  on a Chinese Windows (ACP 936) the UTF-8 bytes are read as GBK, a closing
+  quote gets swallowed as a double-byte trail byte, and the whole script dies
+  with a ParserError before it can run at all. This is invisible on a machine
+  whose ACP is already 65001/UTF-8, so it only ever shows up on someone else's
+  computer. Do not let an editor "clean up" the BOM.
 
   Talks to the connected phone through the Windows Portable Devices (WPD) /
   MTP channel — the same one File Explorer uses to show "This PC > <phone> >
