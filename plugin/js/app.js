@@ -106,6 +106,11 @@ function wireEvents() {
   $('importBtn').onclick = doImport;
   $('deleteBtn').onclick = doDelete;
 
+  // Whether the button is still held decides if a finished transfer can still
+  // become a real drag (see onTileDragStart).
+  window.addEventListener('mouseup', () => { mouseIsDown = false; });
+  window.addEventListener('blur', () => { mouseIsDown = false; });
+
   $('grid').addEventListener('scroll', () => {
     if (!scrollScheduled) { scrollScheduled = true; requestAnimationFrame(() => { scrollScheduled = false; updateVisible(); }); }
   });
@@ -325,6 +330,11 @@ function makeTile(index) {
   el.oncontextmenu = (e) => onTileContext(index, e);
   el.ondblclick = () => openViewer(index);
   el.draggable = true;
+  // mousedown/mouseenter start pulling the original early so that dragstart can
+  // hand Eagle a real file immediately — see onTileDragStart.
+  el.addEventListener('mousedown', (e) => onTileMouseDown(index, e));
+  el.addEventListener('mouseenter', () => onTileMouseEnter(index));
+  el.addEventListener('mouseleave', () => clearTimeout(prefetchTimer));
   el.addEventListener('dragstart', (e) => onTileDragStart(index, e));
   return el;
 }
@@ -646,33 +656,152 @@ function deviceOp(fn) {
 }
 function queuedPreview(item) { return deviceOp(() => backend.preview(state.device, item, state.previewDir)); }
 
-// --- Drag-to-Eagle: hand Eagle the ORIGINAL file, not the thumbnail. ---
-const dragCache = new Map();  // id -> local original path
-async function transferOriginalsForDrag(items) {
+// --- Drag-to-Eagle: hand Eagle the ORIGINAL file, not the thumbnail. --------
+// Eagle can only accept a real file on disk, so the original must be off the
+// phone BEFORE the OS drag can start. Fetching it inside dragstart is too late:
+// the gesture is over by the time a multi-second MTP transfer returns, so the
+// drag silently did nothing and only a repeat attempt (file now cached) worked.
+// Instead the transfer starts early — on hover, and again on mousedown — so
+// dragstart can hand Eagle a cached path synchronously and the drag is instant.
+// When it isn't ready yet, a ghost keeps the gesture alive and the real drag
+// begins the moment the file lands (as long as the button is still down).
+const dragCache = new Map();     // id -> local original path (insertion order = LRU)
+const dragInflight = new Map();  // id -> Promise, so one file is pulled only once
+const DRAG_CACHE_MAX = 80;       // originals are big; keep the drag cache bounded
+let mouseIsDown = false, prefetchTimer = null, prefetchBusy = false;
+let activeDrag = null, dragToken = 0;
+
+function ensureDragDir() {
   const dir = nodePath.join(backend.cacheBase(), 'drag');
   try { nodeFs.mkdirSync(dir, { recursive: true }); } catch (_) {}
-  const paths = [], toFetch = [];
-  for (const it of items) {
-    const c = dragCache.get(it.id);
-    if (c && nodeFs.existsSync(c)) paths.push(c); else toFetch.push(it);
-  }
-  if (toFetch.length) {
-    const res = await deviceOp(() => backend.copy(state.device, toFetch.map(pick), dir));
-    for (const r of (res.results || [])) if (r.ok && r.path) { dragCache.set(r.id, r.path); paths.push(r.path); }
-  }
-  return paths;
+  return dir;
 }
+function hasCached(id) {
+  const p = dragCache.get(id);
+  if (!p) return false;
+  if (nodeFs.existsSync(p)) return true;
+  dragCache.delete(id); return false;   // wiped behind our back
+}
+// Paths for items, but only if every one is already local — the instant path.
+function cachedDragPaths(items) {
+  if (!items.every((it) => hasCached(it.id))) return null;
+  return items.map((it) => dragCache.get(it.id));
+}
+// Once the OS drag is running it owns the gesture and the mouseup never reaches
+// this window, so the button state has to be dropped here.
+function beginOsDrag(paths) {
+  mouseIsDown = false;
+  setStatus(`拖拽 ${paths.length} 个原图到 Eagle`);
+  eagle.drag.startDrag(paths);
+}
+function trimDragCache(keep) {
+  while (dragCache.size > DRAG_CACHE_MAX) {
+    const [id, p] = dragCache.entries().next().value;
+    if (keep && keep.has(id)) break;   // never evict what's being dragged now
+    dragCache.delete(id);
+    try { nodeFs.unlinkSync(p); } catch (_) {}
+  }
+}
+function dragItemsFor(index) {
+  const it = state.view[index];
+  return (state.selected.has(it.id) && state.selected.size > 0) ? selectedItems() : [pick(it)];
+}
+
+async function transferOriginalsForDrag(items) {
+  // Hover, mousedown and dragstart all ask for the same file; join whatever is
+  // already running instead of pulling it off the phone two or three times.
+  const pending = items.map((it) => dragInflight.get(it.id)).filter(Boolean);
+  if (pending.length) { try { await Promise.all(pending); } catch (_) {} }
+  const toFetch = items.filter((it) => !hasCached(it.id));
+  if (toFetch.length) {
+    const job = deviceOp(() => backend.copy(state.device, toFetch.map(pick), ensureDragDir()))
+      .then((res) => { for (const r of (res.results || [])) if (r.ok && r.path) dragCache.set(r.id, r.path); });
+    toFetch.forEach((it) => dragInflight.set(it.id, job));
+    try { await job; } finally { toFetch.forEach((it) => dragInflight.delete(it.id)); }
+  }
+  trimDragCache(new Set(items.map((it) => it.id)));
+  return items.map((it) => dragCache.get(it.id)).filter(Boolean);
+}
+
+function kickPrefetch(items) {
+  if (prefetchBusy || !items.some((it) => !hasCached(it.id))) return;
+  prefetchBusy = true;
+  transferOriginalsForDrag(items).catch(() => {}).then(() => { prefetchBusy = false; });
+}
+function onTileMouseDown(index, e) {
+  if (e.button !== 0) return;
+  mouseIsDown = true;
+  // A press is only a maybe-drag — a plain click lands here too. Prefetch just
+  // the head of the drag set so a stray click on a 500-photo selection doesn't
+  // pull 500 originals; a real drag transfers the rest behind the ghost.
+  kickPrefetch(dragItemsFor(index).slice(0, 8));
+}
+// Resting the pointer on a tile usually means it's about to be dragged, so pull
+// the original then — by mousedown it's often already local and the drag is
+// instant. Skipped while thumbnails are loading so browsing never starves.
+function onTileMouseEnter(index) {
+  clearTimeout(prefetchTimer);
+  prefetchTimer = setTimeout(() => {
+    const it = state.view[index];
+    if (!it || it.kind === 'video' || state.thumbBusy) return;   // videos are too big to speculate on
+    kickPrefetch([pick(it)]);
+  }, 250);
+}
+
+function makeGhost(index, count, x, y) {
+  const it = state.view[index];
+  const g = document.createElement('div');
+  g.className = 'drag-ghost';
+  const thumb = state.thumbCache.get(it.id);
+  if (thumb) { const im = document.createElement('img'); im.src = fileUrl.pathToFileURL(thumb).href; g.appendChild(im); }
+  if (count > 1) { const c = document.createElement('div'); c.className = 'dg-count'; c.textContent = count; g.appendChild(c); }
+  const bar = document.createElement('div'); bar.className = 'dg-bar'; bar.appendChild(document.createElement('i'));
+  g.appendChild(bar);
+  g.style.left = x + 'px'; g.style.top = y + 'px';
+  document.body.appendChild(g);
+  requestAnimationFrame(() => g.classList.add('on'));
+  return g;
+}
+function moveGhost(e) {
+  if (activeDrag && activeDrag.ghost) { activeDrag.ghost.style.left = e.clientX + 'px'; activeDrag.ghost.style.top = e.clientY + 'px'; }
+}
+function endGhost() {
+  window.removeEventListener('mousemove', moveGhost);
+  if (activeDrag) {
+    if (activeDrag.ghost) activeDrag.ghost.remove();
+    if (activeDrag.tile) activeDrag.tile.classList.remove('dragging');
+  }
+  activeDrag = null;
+}
+
 async function onTileDragStart(index, e) {
-  e.preventDefault();  // block the default thumbnail-image drag
+  e.preventDefault();   // we always hand Eagle the files ourselves
   if (!(typeof eagle !== 'undefined' && eagle.drag && eagle.drag.startDrag)) return;
   const it = state.view[index]; if (!it) return;
-  const items = state.selected.has(it.id) && state.selected.size > 0 ? selectedItems() : [pick(it)];
-  setStatus(items.length > 1 ? `正在准备 ${items.length} 张原图…拖住不放` : '正在准备原图…拖住不放');
+  const items = dragItemsFor(index);
+
+  // Already local: start the real OS drag right now, inside the gesture.
+  const ready = cachedDragPaths(items);
+  if (ready) { beginOsDrag(ready); return; }
+
+  // Not local yet: hold the gesture with a ghost until the transfer lands.
+  const token = ++dragToken;
+  endGhost();
+  activeDrag = { token, tile: state.renderedTiles.get(index), ghost: makeGhost(index, items.length, e.clientX, e.clientY) };
+  if (activeDrag.tile) activeDrag.tile.classList.add('dragging');
+  window.addEventListener('mousemove', moveGhost);
+  setStatus(items.length > 1 ? `正在准备 ${items.length} 张原图…按住不放` : '正在准备原图…按住不放');
   try {
     const paths = await transferOriginalsForDrag(items);
-    if (paths.length) { setStatus(`拖拽 ${paths.length} 个原图到 Eagle`); await eagle.drag.startDrag(paths); }
-    else setStatus('原图准备失败（iPhone 可能在 iCloud 未下载到本机；或文件已被移动）', true);
-  } catch (err) { setStatus('准备原图出错：' + (err && err.message), true); }
+    if (token !== dragToken) return;   // a newer drag took over
+    if (!paths.length) { setStatus('原图准备失败（iPhone 可能在 iCloud 未下载到本机；或文件已被移动）', true); return; }
+    if (mouseIsDown) beginOsDrag(paths);
+    else setStatus(`原图已就绪（${paths.length} 个），再拖一次即可，这次是即时的`);
+  } catch (err) {
+    setStatus('准备原图出错：' + (err && err.message), true);
+  } finally {
+    if (token === dragToken) endGhost();
+  }
 }
 
 async function loadPreview(index) {

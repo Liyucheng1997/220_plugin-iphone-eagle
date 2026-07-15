@@ -376,6 +376,7 @@ function Ensure-WpdType {
 using System;
 using System.IO;
 using System.Text;
+using System.Threading;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using ComTypes = System.Runtime.InteropServices.ComTypes;
@@ -394,6 +395,7 @@ public static class Wpd
 
     static readonly Guid OBJ = new Guid("EF6B490D-5CD8-437A-AFFC-DA8B60EE4A3C");
     static PROPERTYKEY K(uint pid){ PROPERTYKEY k; k.fmtid=OBJ; k.pid=pid; return k; }
+    static PROPERTYKEY WPD_OBJECT_ID                 = K(2);
     static PROPERTYKEY WPD_OBJECT_NAME               = K(4);
     static PROPERTYKEY WPD_OBJECT_CONTENT_TYPE       = K(7);
     static PROPERTYKEY WPD_OBJECT_ORIGINAL_FILE_NAME = K(12);
@@ -414,11 +416,24 @@ public static class Wpd
         void GetDeviceDescription([MarshalAs(UnmanagedType.LPWStr)] string id, [In,Out] StringBuilder desc, [In,Out] ref uint pcch);
         void GetDeviceManufacturer([MarshalAs(UnmanagedType.LPWStr)] string id, [In,Out] StringBuilder mfr, [In,Out] ref uint pcch);
     }
+    // Open() starts an MTP session and MTP allows exactly ONE per device, so
+    // Close() is mandatory — leaving it to process teardown is what wedged the
+    // device after a delete: the stale session had to time out in the driver
+    // before the next Open() could be granted, and our watchdog killed the
+    // read first, leaking yet another session. Every slot up to Close must be
+    // declared or the call lands on the wrong method (slot order verified
+    // against the SDK's IPortableDeviceVtbl: Close is slot 8).
     [ComImport, Guid("625E2DF8-6392-4CF0-9AD1-3CFA5F17775C"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IPortableDevice {
         void Open([MarshalAs(UnmanagedType.LPWStr)] string id, IPortableDeviceValues clientInfo);
         void SendCommand(int flags, IntPtr pParams, out IntPtr ppResults);
         void Content(out IPortableDeviceContent ppContent);
+        void Capabilities(out IntPtr ppCapabilities);   // unused slot
+        void Cancel();
+        void Close();
+        void Advise(int dwFlags, IntPtr pCallback, IntPtr pParameters, out IntPtr ppszCookie);  // unused slot
+        void Unadvise([MarshalAs(UnmanagedType.LPWStr)] string pszCookie);                      // unused slot
+        void GetPnPDeviceID(out IntPtr ppszPnPDeviceID);                                        // unused slot
     }
     [ComImport, Guid("6A96ED84-7C73-4480-9938-BF5AF477D426"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IPortableDeviceContent {
@@ -457,6 +472,39 @@ public static class Wpd
         void GetPropertyAttributes([MarshalAs(UnmanagedType.LPWStr)] string objId, ref PROPERTYKEY key, out IPortableDeviceValues ppAttrs);
         void GetValues([MarshalAs(UnmanagedType.LPWStr)] string objId, IPortableDeviceKeyCollection pKeys, out IPortableDeviceValues ppValues);
     }
+    // ---- Bulk property reads (the difference between 2s and 200s) ----------
+    // props.GetValues() is ONE call per object. Apple's driver caches properties
+    // so that's cheap, but the in-box MTP driver Android uses turns every call
+    // into a separate MTP transaction (~20ms), which is why a 10k-photo Android
+    // library crawled. IPortableDevicePropertiesBulk maps onto the MTP
+    // GetObjectPropList operation: one transaction for a whole folder.
+    // Not every device implements it — the QI below returns null then, and we
+    // fall back to the per-object loop. All four IIDs verified against
+    // HKLM\SOFTWARE\Classes\Interface; a wrong one QIs to E_NOINTERFACE and
+    // silently disables the fast path (see the PropVariantCollection note above).
+    [ComImport, Guid("6E3F2D79-4E07-48C4-8208-D8C2E5AF4A99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPortableDeviceValuesCollection {
+        void GetCount(ref uint pcElems);
+        void GetAt(uint index, out IPortableDeviceValues ppValues);
+        void Add(IPortableDeviceValues pValues);
+        void Clear();
+        void RemoveAt(uint index);
+    }
+    [ComImport, Guid("9DEACB80-11E8-40E3-A9F3-F557986A7845"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPortableDevicePropertiesBulkCallback {
+        void OnStart(ref Guid pContext);
+        void OnProgress(ref Guid pContext, IPortableDeviceValuesCollection pResults);
+        void OnEnd(ref Guid pContext, int hrStatus);
+    }
+    [ComImport, Guid("482B05C0-4056-44ED-9E0F-5E23B009DA93"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPortableDevicePropertiesBulk {
+        void QueueGetValuesByObjectList(IPortableDevicePropVariantCollection pObjectIDs, IPortableDeviceKeyCollection pKeys, IPortableDevicePropertiesBulkCallback pCallback, out Guid pContext);
+        void QueueGetValuesByObjectFormat(ref Guid pguidObjectFormat, [MarshalAs(UnmanagedType.LPWStr)] string pszParentObjectID, uint dwDepth, IPortableDeviceKeyCollection pKeys, IPortableDevicePropertiesBulkCallback pCallback, out Guid pContext);
+        void QueueSetValuesByObjectList(IPortableDeviceValuesCollection pObjectValues, IPortableDevicePropertiesBulkCallback pCallback, out Guid pContext);
+        void Start(ref Guid pContext);
+        void Cancel(ref Guid pContext);
+    }
+
     [ComImport, Guid("DADA2357-E0AD-492E-98DB-DD61C53BA353"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IPortableDeviceKeyCollection {
         void GetCount(ref uint pcElems);
@@ -494,6 +542,28 @@ public static class Wpd
     }
 
     static object CreateCom(Guid clsid){ return Activator.CreateInstance(Type.GetTypeFromCLSID(clsid)); }
+
+    // Release a COM wrapper. Order matters: children (content/props/resources)
+    // hold their own refs to the device, so releasing the device first closed
+    // nothing at all — which is how sessions leaked.
+    static void Rel(object o){ if(o != null){ try { Marshal.FinalReleaseComObject(o); } catch {} } }
+
+    // Open a session. Pair EVERY call with CloseDevice in a finally. A throwing
+    // Open must not leak the wrapper either — the caller's `dev` stays null, so
+    // only we can still see it.
+    static IPortableDevice OpenDevice(string deviceId){
+        var dev = (IPortableDevice)CreateCom(CLSID_DeviceFTM);
+        try { dev.Open(deviceId, MakeClientInfo()); }
+        catch { Rel(dev); throw; }
+        return dev;
+    }
+    // End the MTP session, then drop the wrapper. Close() is what actually frees
+    // the device for the next process; without it the driver holds the session.
+    static void CloseDevice(IPortableDevice dev){
+        if(dev == null) return;
+        try { dev.Close(); } catch {}
+        Rel(dev);
+    }
     static string SbGet(Action<StringBuilder> call){ try { var sb=new StringBuilder(260); call(sb); return sb.ToString(); } catch { return ""; } }
 
     static bool IsMedia(string name, out bool video){
@@ -635,16 +705,123 @@ public static class Wpd
     static int _count, _media, _max; static bool _first; static StringBuilder _sb;
     public static int LastCount;
 
+    // The two properties the scan actually needs per object.
+    class ObjInfo { public string Name; public Guid Ct; }
+
+    static IPortableDevicePropertiesBulk _bulk;   // null = device has no bulk support
+    static bool _bulkOk;
+    static int _bulkFails;
+
+    // Collects the values WPD hands back on its own worker thread. Results are
+    // keyed by object id because the device may return them in any order and may
+    // omit objects it can't describe.
+    class BulkCallback : IPortableDevicePropertiesBulkCallback
+    {
+        public readonly Dictionary<string, ObjInfo> Map = new Dictionary<string, ObjInfo>();
+        public readonly ManualResetEvent Done = new ManualResetEvent(false);
+        public int Hr;
+
+        public void OnStart(ref Guid ctx) {}
+
+        public void OnProgress(ref Guid ctx, IPortableDeviceValuesCollection results){
+            uint n = 0;
+            try { results.GetCount(ref n); } catch { return; }
+            for(uint i = 0; i < n; i++){
+                IPortableDeviceValues v = null;
+                try { results.GetAt(i, out v); } catch { continue; }
+                try {
+                    string oid = null;
+                    try { var k = WPD_OBJECT_ID; v.GetStringValue(ref k, out oid); } catch {}
+                    if(string.IsNullOrEmpty(oid)) continue;
+                    string nm = null;
+                    try { var k = WPD_OBJECT_ORIGINAL_FILE_NAME; v.GetStringValue(ref k, out nm); } catch {}
+                    if(string.IsNullOrEmpty(nm)){ try { var k = WPD_OBJECT_NAME; v.GetStringValue(ref k, out nm); } catch {} }
+                    Guid ct = Guid.Empty;
+                    try { var k = WPD_OBJECT_CONTENT_TYPE; v.GetGuidValue(ref k, out ct); } catch {}
+                    Map[oid] = new ObjInfo { Name = nm, Ct = ct };
+                } finally { try { Marshal.FinalReleaseComObject(v); } catch {} }
+            }
+        }
+
+        public void OnEnd(ref Guid ctx, int hrStatus){ Hr = hrStatus; Done.Set(); }
+    }
+
+    // One bulk request for a whole folder's worth of object ids. Returns null if
+    // the device refused or went quiet, so the caller can fall back.
+    static Dictionary<string, ObjInfo> FetchBulk(IPortableDeviceKeyCollection keys, List<string> oids){
+        var coll = (IPortableDevicePropVariantCollection)CreateCom(CLSID_PropVariantCollection);
+        foreach(var oid in oids){
+            PROPVARIANT pv = new PROPVARIANT(); pv.vt = 31; pv.p = Marshal.StringToCoTaskMemUni(oid);
+            coll.Add(ref pv);
+            Marshal.FreeCoTaskMem(pv.p);
+        }
+        var cb = new BulkCallback();
+        Dictionary<string, ObjInfo> map = null;
+        try {
+            Guid ctx;
+            _bulk.QueueGetValuesByObjectList(coll, keys, cb, out ctx);
+            _bulk.Start(ref ctx);
+            // The wait is why the scan runs on an MTA thread: on an STA the
+            // callback would be marshalled back to this blocked thread.
+            if(cb.Done.WaitOne(180000)) map = cb.Map;
+            else { try { _bulk.Cancel(ref ctx); } catch {} }
+        } catch { map = null; }
+        try { Marshal.FinalReleaseComObject(coll); } catch {}
+        return map;
+    }
+
+    // Name + content type for every object id, in as few round-trips as the
+    // device allows.
+    static Dictionary<string, ObjInfo> FetchProps(IPortableDeviceProperties props,
+                                                  IPortableDeviceKeyCollection keys, List<string> oids){
+        var map = new Dictionary<string, ObjInfo>();
+        if(oids.Count == 0) return map;
+
+        // Only worth a bulk round-trip for a real folder. The device root holds
+        // just a storage or two, and judging bulk support on those would be
+        // wrong: a storage/functional object can refuse a property list even
+        // though the photo folders underneath serve it fine. Requiring a couple
+        // of failures on real folders avoids disabling the fast path over one
+        // hiccup.
+        if(_bulk != null && _bulkOk && oids.Count >= 8){
+            var m = FetchBulk(keys, oids);
+            if(m != null && m.Count > 0){
+                foreach(var kv in m) map[kv.Key] = kv.Value;
+                if(map.Count >= oids.Count) return map;   // complete; done in one transaction
+            } else if(++_bulkFails >= 2){
+                _bulkOk = false;   // device won't serve it — stop paying for the attempt
+                Console.Error.WriteLine("BULK unsupported on this device; using per-object reads");
+            }
+        }
+        // Per-object fallback: whole folder if bulk is unavailable, otherwise just
+        // the stragglers the device left out.
+        foreach(var oid in oids){
+            if(map.ContainsKey(oid)) continue;
+            IPortableDeviceValues vals;
+            try { props.GetValues(oid, keys, out vals); } catch { continue; }
+            Guid ct = Guid.Empty;
+            try { var kc = WPD_OBJECT_CONTENT_TYPE; vals.GetGuidValue(ref kc, out ct); } catch {}
+            string nm = null;
+            try { var kn = WPD_OBJECT_ORIGINAL_FILE_NAME; vals.GetStringValue(ref kn, out nm); } catch {}
+            if(string.IsNullOrEmpty(nm)){ try { var kn = WPD_OBJECT_NAME; vals.GetStringValue(ref kn, out nm); } catch {} }
+            // Full release is essential: a lingering ref makes the device
+            // progressively stall (rate collapses ~200x after a few thousand).
+            try { Marshal.FinalReleaseComObject(vals); } catch {}
+            map[oid] = new ObjInfo { Name = nm, Ct = ct };
+        }
+        return map;
+    }
+
     // Stream one resource of one object to a file. isThumb=true -> the small JPEG
     // thumbnail; false -> WPD_RESOURCE_DEFAULT (the full original file). Returns
     // bytes written, or -1 on failure.
     public static long SaveResource(string deviceId, string oid, bool isThumb, string outPath){
         long total = -1;
-        var dev = (IPortableDevice)CreateCom(CLSID_DeviceFTM);
-        dev.Open(deviceId, MakeClientInfo());
-        IPortableDeviceContent content; dev.Content(out content);
-        IPortableDeviceResources res; content.Transfer(out res);
+        IPortableDevice dev = null; IPortableDeviceContent content = null; IPortableDeviceResources res = null;
         try {
+            dev = OpenDevice(deviceId);
+            dev.Content(out content);
+            content.Transfer(out res);
             PROPERTYKEY key; key.fmtid = isThumb ? RES_THUMBNAIL : RES_DEFAULT_FMTID; key.pid = 0;
             uint optimal=0; ComTypes.IStream stream;
             res.GetStream(oid, ref key, 0, ref optimal, out stream);
@@ -653,102 +830,137 @@ public static class Wpd
                 while(true){ stream.Read(buf, buf.Length, pcb); int r=Marshal.ReadInt32(pcb); if(r<=0) break; fs.Write(buf,0,r); total+=r; }
                 Marshal.FreeHGlobal(pcb);
             }
-            try { Marshal.FinalReleaseComObject(stream); } catch {}
+            Rel(stream);
         } catch { total = -1; }
-        try { Marshal.FinalReleaseComObject(res); } catch {}
-        try { Marshal.FinalReleaseComObject(dev); } catch {}
+        finally { Rel(res); Rel(content); CloseDevice(dev); }
         return total;
     }
 
     // Capture date for ONE object (cheap for a single item; too slow for all).
     public static string GetDate(string deviceId, string oid){
         string dt = null;
+        IPortableDevice dev = null; IPortableDeviceContent content = null; IPortableDeviceProperties props = null;
+        IPortableDeviceKeyCollection keys = null;
         try {
-            var dev = (IPortableDevice)CreateCom(CLSID_DeviceFTM);
-            dev.Open(deviceId, MakeClientInfo());
-            IPortableDeviceContent content; dev.Content(out content);
-            IPortableDeviceProperties props; content.Properties(out props);
-            var keys = (IPortableDeviceKeyCollection)CreateCom(CLSID_KeyCollection);
+            dev = OpenDevice(deviceId);
+            dev.Content(out content);
+            content.Properties(out props);
+            keys = (IPortableDeviceKeyCollection)CreateCom(CLSID_KeyCollection);
             var k = WPD_OBJECT_DATE_CREATED; keys.Add(ref k);
             IPortableDeviceValues v; props.GetValues(oid, keys, out v);
             try { var kk = WPD_OBJECT_DATE_CREATED; v.GetStringValue(ref kk, out dt); } catch {}
-            try { Marshal.FinalReleaseComObject(v); } catch {}
-            try { Marshal.FinalReleaseComObject(dev); } catch {}
+            Rel(v);
         } catch {}
+        finally { Rel(keys); Rel(props); Rel(content); CloseDevice(dev); }
         return dt;
     }
 
     // Does an object still exist on the device? (opens its own session.) Used to
     // confirm a delete without re-enumerating the whole library.
     public static bool ObjectExists(string deviceId, string oid){
+        IPortableDevice dev = null; IPortableDeviceContent content = null; IPortableDeviceProperties props = null;
+        IPortableDeviceKeyCollection keys = null;
         try {
-            var dev = (IPortableDevice)CreateCom(CLSID_DeviceFTM);
-            dev.Open(deviceId, MakeClientInfo());
-            IPortableDeviceContent content; dev.Content(out content);
-            IPortableDeviceProperties props; content.Properties(out props);
-            var keys = (IPortableDeviceKeyCollection)CreateCom(CLSID_KeyCollection);
+            dev = OpenDevice(deviceId);
+            dev.Content(out content);
+            content.Properties(out props);
+            keys = (IPortableDeviceKeyCollection)CreateCom(CLSID_KeyCollection);
             var k = WPD_OBJECT_NAME; keys.Add(ref k);
             bool exists;
             try {
                 IPortableDeviceValues v; props.GetValues(oid, keys, out v);
                 string nm=null; try { var kk=WPD_OBJECT_NAME; v.GetStringValue(ref kk, out nm); } catch {}
-                try { Marshal.FinalReleaseComObject(v); } catch {}
+                Rel(v);
                 exists = (nm != null);
             } catch { exists = false; }
-            try { Marshal.FinalReleaseComObject(dev); } catch {}
             return exists;
         } catch { return true; }   // can't tell → assume present (reports as not-deleted)
+        finally { Rel(keys); Rel(props); Rel(content); CloseDevice(dev); }
     }
 
     // Delete objects from the device by object id (frees phone storage). Returns a
     // JSON array [{oid,hr,exists}] so the caller can tell, per object, the delete
     // HRESULT AND whether it's actually gone (some devices return S_OK but keep the
     // file, or refuse with an access-denied HRESULT). VT_LPWSTR = 31.
+    // Deletes are issued ONE OBJECT PER CALL, on purpose. Handing Delete() a
+    // multi-object collection makes this device (Huawei P30 Pro, verified)
+    // return a NULL results collection — no per-object status at all, and the
+    // NullReferenceException that caused was swallowed, leaving every HRESULT
+    // reported as 0. A single-object delete returns a proper result (rc=1,
+    // VT_ERROR scode), and it's the only form confirmed to actually remove a
+    // real photo. One call per object also gives a per-object stderr heartbeat,
+    // so a big selection can't sit silent long enough for the watchdog to kill
+    // us mid-delete (which would leak the MTP session and wedge the device).
     public static string DeleteObjectsDiag(string deviceId, string[] oids){
-        var dev = (IPortableDevice)CreateCom(CLSID_DeviceFTM);
-        dev.Open(deviceId, MakeClientInfo());
-        IPortableDeviceContent content; dev.Content(out content);
-        IPortableDeviceProperties props; content.Properties(out props);
-        var nameKeys = (IPortableDeviceKeyCollection)CreateCom(CLSID_KeyCollection);
-        var kn = WPD_OBJECT_NAME; nameKeys.Add(ref kn);
-
-        var coll = (IPortableDevicePropVariantCollection)CreateCom(CLSID_PropVariantCollection);
-        foreach(var oid in oids){
-            PROPVARIANT pv = new PROPVARIANT(); pv.vt=31; pv.p=Marshal.StringToCoTaskMemUni(oid);
-            coll.Add(ref pv);
-            Marshal.FreeCoTaskMem(pv.p);
-        }
-        int[] hrs = new int[oids.Length];
+        IPortableDevice dev = null;
+        IPortableDeviceContent content = null;
+        IPortableDeviceProperties props = null;
+        IPortableDeviceKeyCollection nameKeys = null;
+        var sb = new StringBuilder();
+        var hrs = new int[oids.Length];
+        var hrKnown = new bool[oids.Length];
         try {
-            IPortableDevicePropVariantCollection results;
-            content.Delete(0, coll, out results);   // 0 = no recursion
-            try {
-                uint rc=0; results.GetCount(ref rc);
-                for(uint i=0;i<rc && i<oids.Length;i++){
-                    PROPVARIANT rv; results.GetAt(i, out rv);
-                    hrs[i] = (int)(rv.p.ToInt64() & 0xFFFFFFFF);   // VT_ERROR scode (best-effort)
-                }
-            } catch {}
-            try { Marshal.FinalReleaseComObject(results); } catch {}
-        } catch (Exception ex) { for(int i=0;i<hrs.Length;i++) hrs[i]=ex.HResult; }
-        try { Marshal.FinalReleaseComObject(coll); } catch {}
+            dev = OpenDevice(deviceId);
+            dev.Content(out content);
+            content.Properties(out props);
+            nameKeys = (IPortableDeviceKeyCollection)CreateCom(CLSID_KeyCollection);
+            var kn = WPD_OBJECT_NAME; nameKeys.Add(ref kn);
 
-        var sb=new StringBuilder(); sb.Append('[');
-        for(int i=0;i<oids.Length;i++){
-            bool exists;
-            try {
-                IPortableDeviceValues v; props.GetValues(oids[i], nameKeys, out v);
-                string nm=null; try { var k=WPD_OBJECT_NAME; v.GetStringValue(ref k, out nm); } catch {}
-                try { Marshal.FinalReleaseComObject(v); } catch {}
-                exists = (nm != null);
-            } catch { exists = false; }
-            if(i>0) sb.Append(',');
-            sb.Append("{\"oid\":"); JsonEsc(sb, oids[i]);
-            sb.Append(",\"hr\":"); sb.Append(hrs[i]);
-            sb.Append(",\"exists\":"); sb.Append(exists?"true":"false"); sb.Append('}');
+            for(int i=0;i<oids.Length;i++){
+                Console.Error.WriteLine("DELETING " + (i+1) + "/" + oids.Length);
+                IPortableDevicePropVariantCollection coll = null;
+                try {
+                    coll = (IPortableDevicePropVariantCollection)CreateCom(CLSID_PropVariantCollection);
+                    PROPVARIANT pv = new PROPVARIANT(); pv.vt=31; pv.p=Marshal.StringToCoTaskMemUni(oids[i]);
+                    coll.Add(ref pv);
+                    Marshal.FreeCoTaskMem(pv.p);
+                    IPortableDevicePropVariantCollection results = null;
+                    content.Delete(0, coll, out results);   // 0 = no recursion
+                    if(results != null){
+                        try {
+                            uint rc=0; results.GetCount(ref rc);
+                            if(rc>0){
+                                PROPVARIANT rv; results.GetAt(0, out rv);
+                                hrs[i] = (int)(rv.p.ToInt64() & 0xFFFFFFFF);   // VT_ERROR scode
+                                hrKnown[i] = true;
+                            }
+                        } catch {}
+                        Rel(results);
+                    }
+                } catch (Exception ex) { hrs[i] = ex.HResult; hrKnown[i] = true; }
+                finally { Rel(coll); }
+            }
+            Console.Error.WriteLine("DELETED, verifying");
+
+            // Let the device finish applying the delete before we ask about the
+            // objects again — querying a just-deleted handle is what some drivers
+            // choke on.
+            Thread.Sleep(250);
+
+            sb.Append('[');
+            for(int i=0;i<oids.Length;i++){
+                bool exists;
+                try {
+                    IPortableDeviceValues v; props.GetValues(oids[i], nameKeys, out v);
+                    string nm=null; try { var k=WPD_OBJECT_NAME; v.GetStringValue(ref k, out nm); } catch {}
+                    Rel(v);
+                    exists = (nm != null);
+                } catch { exists = false; }
+                if(i>0) sb.Append(',');
+                sb.Append("{\"oid\":"); JsonEsc(sb, oids[i]);
+                // null, not 0: "the device told us nothing" must not read as S_OK.
+                sb.Append(",\"hr\":"); sb.Append(hrKnown[i] ? hrs[i].ToString() : "null");
+                sb.Append(",\"exists\":"); sb.Append(exists?"true":"false"); sb.Append('}');
+                if((i & 7)==0) Console.Error.WriteLine("VERIFY " + (i+1) + "/" + oids.Length);
+            }
+            sb.Append(']');
+        } finally {
+            // Children first, device last, and Close() before the release —
+            // otherwise the session outlives this process and the next read hangs.
+            Rel(nameKeys); Rel(props); Rel(content);
+            CloseDevice(dev);
+            Console.Error.WriteLine("session closed");
         }
-        sb.Append(']');
-        try { Marshal.FinalReleaseComObject(dev); } catch {}
         return sb.ToString();
     }
 
@@ -775,46 +987,78 @@ public static class Wpd
 
     public static int SaveThumbnails(string deviceId, string[] oids, string[] outPaths){
         int ok=0;
-        var dev = (IPortableDevice)CreateCom(CLSID_DeviceFTM);
-        dev.Open(deviceId, MakeClientInfo());
-        IPortableDeviceContent content; dev.Content(out content);
-        IPortableDeviceResources res; content.Transfer(out res);
-        PROPERTYKEY key = ResolveThumbKey(res, oids);
-        Console.Error.WriteLine("THUMBKEY " + key.fmtid.ToString() + ":" + key.pid);
-        for(int i=0;i<oids.Length;i++){
-            try {
-                uint optimal=0; ComTypes.IStream stream;
-                res.GetStream(oids[i], ref key, 0, ref optimal, out stream);
-                var ms=new MemoryStream(); var buf=new byte[optimal>0?(int)optimal:65536];
-                IntPtr pcb=Marshal.AllocHGlobal(4);
-                while(true){ stream.Read(buf, buf.Length, pcb); int r=Marshal.ReadInt32(pcb); if(r<=0) break; ms.Write(buf,0,r); }
-                Marshal.FreeHGlobal(pcb);
-                try { Marshal.FinalReleaseComObject(stream); } catch {}
-                File.WriteAllBytes(outPaths[i], ms.ToArray());
-                ok++;
-            } catch {}
-        }
-        try { Marshal.FinalReleaseComObject(res); } catch {}
-        try { Marshal.FinalReleaseComObject(dev); } catch {}
+        IPortableDevice dev = null; IPortableDeviceContent content = null; IPortableDeviceResources res = null;
+        try {
+            dev = OpenDevice(deviceId);
+            dev.Content(out content);
+            content.Transfer(out res);
+            PROPERTYKEY key = ResolveThumbKey(res, oids);
+            Console.Error.WriteLine("THUMBKEY " + key.fmtid.ToString() + ":" + key.pid);
+            for(int i=0;i<oids.Length;i++){
+                try {
+                    uint optimal=0; ComTypes.IStream stream;
+                    res.GetStream(oids[i], ref key, 0, ref optimal, out stream);
+                    var ms=new MemoryStream(); var buf=new byte[optimal>0?(int)optimal:65536];
+                    IntPtr pcb=Marshal.AllocHGlobal(4);
+                    while(true){ stream.Read(buf, buf.Length, pcb); int r=Marshal.ReadInt32(pcb); if(r<=0) break; ms.Write(buf,0,r); }
+                    Marshal.FreeHGlobal(pcb);
+                    Rel(stream);
+                    File.WriteAllBytes(outPaths[i], ms.ToArray());
+                    ok++;
+                } catch {}
+            }
+        } finally { Rel(res); Rel(content); CloseDevice(dev); }
         return ok;
     }
 
-    public static string ListResultJson(string deviceId, string deviceName, int maxCount){
-        var dev = (IPortableDevice)CreateCom(CLSID_DeviceFTM);
-        dev.Open(deviceId, MakeClientInfo());
-        IPortableDeviceContent content; dev.Content(out content);
-        IPortableDeviceProperties props; content.Properties(out props);
-        var keys = (IPortableDeviceKeyCollection)CreateCom(CLSID_KeyCollection);
-        var k1 = WPD_OBJECT_ORIGINAL_FILE_NAME; keys.Add(ref k1);
-        var k2 = WPD_OBJECT_NAME; keys.Add(ref k2);
-        var k3 = WPD_OBJECT_CONTENT_TYPE; keys.Add(ref k3);
+    // Runs the scan on a dedicated MTA thread. PowerShell hosts us on an STA, and
+    // the bulk callback arrives on a WPD worker thread — on an STA that call gets
+    // marshalled back to the thread already blocked in WaitOne, and the scan
+    // deadlocks. An MTA thread takes the callback directly. The big stack is for
+    // the folder recursion.
+    public static string ListResultJsonMta(string deviceId, string deviceName, int maxCount){
+        string res = null; Exception err = null;
+        var t = new Thread(delegate(){
+            try { res = ListResultJson(deviceId, deviceName, maxCount); }
+            catch(Exception ex){ err = ex; }
+        }, 16 * 1024 * 1024);
+        t.SetApartmentState(ApartmentState.MTA);
+        t.IsBackground = true;
+        t.Start();
+        t.Join();
+        if(err != null) throw err;
+        return res;
+    }
 
-        _sb = new StringBuilder(1<<20); _sb.Append('[');
-        _first=true; _count=0; _media=0; _max=maxCount;
-        Walk(content, props, keys, "DEVICE", "", true);
-        _sb.Append(']');
-        try { Marshal.FinalReleaseComObject(dev); } catch {}
-        LastCount = _media;
+    public static string ListResultJson(string deviceId, string deviceName, int maxCount){
+        IPortableDevice dev = null; IPortableDeviceContent content = null; IPortableDeviceProperties props = null;
+        IPortableDeviceKeyCollection keys = null;
+        try {
+            Console.Error.WriteLine("opening device session...");
+            dev = OpenDevice(deviceId);
+            dev.Content(out content);
+            content.Properties(out props);
+            keys = (IPortableDeviceKeyCollection)CreateCom(CLSID_KeyCollection);
+            var k0 = WPD_OBJECT_ID; keys.Add(ref k0);   // bulk results come back unordered
+            var k1 = WPD_OBJECT_ORIGINAL_FILE_NAME; keys.Add(ref k1);
+            var k2 = WPD_OBJECT_NAME; keys.Add(ref k2);
+            var k3 = WPD_OBJECT_CONTENT_TYPE; keys.Add(ref k3);
+
+            _bulk = props as IPortableDevicePropertiesBulk;   // null on devices without it
+            _bulkOk = (_bulk != null); _bulkFails = 0;
+            Console.Error.WriteLine(_bulkOk ? "bulk property reads: yes" : "bulk property reads: no (per-object)");
+
+            _sb = new StringBuilder(1<<20); _sb.Append('[');
+            _first=true; _count=0; _media=0; _max=maxCount;
+            Walk(content, props, keys, "DEVICE", "", true);
+            _sb.Append(']');
+            LastCount = _media;
+        } finally {
+            _bulk = null;
+            Rel(keys); Rel(props); Rel(content);
+            CloseDevice(dev);
+            Console.Error.WriteLine("session closed");
+        }
 
         var outp = new StringBuilder(_sb.Length + 64);
         outp.Append("{\"ok\":true,\"device\":"); JsonEsc(outp, deviceName ?? "Phone");
@@ -825,57 +1069,67 @@ public static class Wpd
 
     static void Walk(IPortableDeviceContent content, IPortableDeviceProperties props,
                      IPortableDeviceKeyCollection keys, string parentId, string prefix, bool atDevice){
+        if(_max>0 && _media>=_max) return;
+        // Entering a folder is a heartbeat for the Node-side idle watchdog.
+        if(prefix.Length>0) Console.Error.WriteLine("SCAN " + prefix);
+
+        // 1) Object ids in this folder. EnumObjects is cheap — it's the property
+        //    reads that cost, so gather the whole folder before asking for them.
+        var oids = new List<string>();
         IEnumPortableDeviceObjectIDs e; content.EnumObjects(0, parentId, null, out e);
         const uint BATCH=64; var arr=new string[BATCH]; uint fetched;
         do {
             fetched=0; e.Next(BATCH, arr, ref fetched);
-            for(uint i=0;i<fetched;i++){
-                if(_max>0 && _media>=_max) break;
-                _count++;
-                string oid=arr[i];
-                IPortableDeviceValues vals;
-                try { props.GetValues(oid, keys, out vals); } catch { continue; }
-                Guid ct=Guid.Empty; try{var kc=WPD_OBJECT_CONTENT_TYPE; vals.GetGuidValue(ref kc, out ct);}catch{}
-                string nm=null; try{var kn=WPD_OBJECT_ORIGINAL_FILE_NAME; vals.GetStringValue(ref kn, out nm);}catch{}
-                if(string.IsNullOrEmpty(nm)){try{var kn=WPD_OBJECT_NAME; vals.GetStringValue(ref kn, out nm);}catch{}}
-                if(string.IsNullOrEmpty(nm)) nm=oid;
-                // Full release is essential: a lingering ref makes the device
-                // progressively stall (rate collapses ~200x after a few thousand).
-                try { Marshal.FinalReleaseComObject(vals); } catch {}
-                if((_count & 0x7FF)==0){ GC.Collect(); GC.WaitForPendingFinalizers(); }
-
-                bool container=(ct==CT_FOLDER || ct==CT_FUNCTIONAL);
-                if(container){
-                    // Never filter a whole storage (device-level child). At the
-                    // storage's top level, only descend into real photo folders;
-                    // deeper down, prune cache/hidden junk.
-                    if(!atDevice){
-                        if(prefix.Length==0){ if(!AllowTopFolder(nm)) continue; }
-                        else if(SkipFolder(nm)) continue;
-                    }
-                    string np = atDevice ? "" : (prefix.Length==0 ? nm : prefix + "/" + nm);
-                    Walk(content, props, keys, oid, np, false);
-                } else {
-                    bool video;
-                    if(IsMedia(nm, out video)){
-                        string p = prefix.Length==0 ? nm : prefix + "/" + nm;
-                        int dot=nm.LastIndexOf('.'); string ext = dot>=0 ? nm.Substring(dot+1).ToLowerInvariant() : "";
-                        if(!_first) _sb.Append(',');
-                        _first=false;
-                        _sb.Append("{\"id\":"); JsonEsc(_sb, p);
-                        _sb.Append(",\"oid\":"); JsonEsc(_sb, oid);
-                        _sb.Append(",\"name\":"); JsonEsc(_sb, nm);
-                        _sb.Append(",\"folder\":"); JsonEsc(_sb, prefix);
-                        _sb.Append(",\"ext\":"); JsonEsc(_sb, ext);
-                        _sb.Append(",\"kind\":"); _sb.Append(video?"\"video\"":"\"image\"");
-                        _sb.Append('}');
-                        _media++;
-                        if((_media % 500)==0) Console.Error.WriteLine("PROGRESS " + _media);
-                    }
-                }
-            }
+            for(uint i=0;i<fetched;i++) oids.Add(arr[i]);
         } while(fetched>0);
         try { Marshal.FinalReleaseComObject(e); } catch {}
+
+        // 2) One bulk transaction for the whole folder where the device supports it.
+        var info = FetchProps(props, keys, oids);
+
+        // 3) Emit files; queue folders and recurse once this folder's data is done.
+        var subs = new List<string[]>();   // {oid, childPrefix}
+        foreach(var oid in oids){
+            if(_max>0 && _media>=_max) break;
+            _count++;
+            if((_count & 0x7FF)==0){ GC.Collect(); GC.WaitForPendingFinalizers(); }
+
+            ObjInfo oi;
+            if(!info.TryGetValue(oid, out oi)) continue;
+            string nm = string.IsNullOrEmpty(oi.Name) ? oid : oi.Name;
+
+            bool container=(oi.Ct==CT_FOLDER || oi.Ct==CT_FUNCTIONAL);
+            if(container){
+                // Never filter a whole storage (device-level child). At the
+                // storage's top level, only descend into real photo folders;
+                // deeper down, prune cache/hidden junk.
+                if(!atDevice){
+                    if(prefix.Length==0){ if(!AllowTopFolder(nm)) continue; }
+                    else if(SkipFolder(nm)) continue;
+                }
+                string np = atDevice ? "" : (prefix.Length==0 ? nm : prefix + "/" + nm);
+                subs.Add(new string[]{ oid, np });
+            } else {
+                bool video;
+                if(IsMedia(nm, out video)){
+                    string p = prefix.Length==0 ? nm : prefix + "/" + nm;
+                    int dot=nm.LastIndexOf('.'); string ext = dot>=0 ? nm.Substring(dot+1).ToLowerInvariant() : "";
+                    if(!_first) _sb.Append(',');
+                    _first=false;
+                    _sb.Append("{\"id\":"); JsonEsc(_sb, p);
+                    _sb.Append(",\"oid\":"); JsonEsc(_sb, oid);
+                    _sb.Append(",\"name\":"); JsonEsc(_sb, nm);
+                    _sb.Append(",\"folder\":"); JsonEsc(_sb, prefix);
+                    _sb.Append(",\"ext\":"); JsonEsc(_sb, ext);
+                    _sb.Append(",\"kind\":"); _sb.Append(video?"\"video\"":"\"image\"");
+                    _sb.Append('}');
+                    _media++;
+                    if((_media % 200)==0) Console.Error.WriteLine("PROGRESS " + _media);
+                }
+            }
+        }
+        info.Clear();
+        foreach(var s in subs) Walk(content, props, keys, s[0], s[1], false);
     }
 }
 '@
@@ -972,8 +1226,9 @@ switch ($Action) {
             if ($devId) {
                 try {
                     Write-Log "fast scan via WPD..."
-                    $json = [Wpd]::ListResultJson($devId, $devName, $Max)
-                    Write-Log "wpd: $([Wpd]::LastCount) media files"
+                    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                    $json = [Wpd]::ListResultJsonMta($devId, $devName, $Max)
+                    Write-Log "wpd: $([Wpd]::LastCount) media files in $([math]::Round($sw.Elapsed.TotalSeconds,1))s"
                     [Console]::Out.WriteLine($json)
                     exit 0
                 } catch { Write-Log "wpd: enumerate failed, falling back to Shell: $($_.Exception.Message)" }
@@ -1181,7 +1436,18 @@ switch ($Action) {
         if ($oids.Count -gt 0) {
             try {
                 $diagJson = [Wpd]::DeleteObjectsDiag($devId, $oids)
-                foreach ($d in @($diagJson | ConvertFrom-Json)) { $diag[$d.oid] = $d }
+                # MUST assign before @(): PS 5.1 hands a multi-element JSON array
+                # to the pipeline as ONE object, so the inline
+                # `@($diagJson | ConvertFrom-Json)` collapsed to Count=1. $d then
+                # became the whole array, $d.oid member-enumerated to an array of
+                # oids, and the hashtable key turned into "System.Object[]" — so
+                # every per-item lookup missed and multi-select delete reported
+                # "设备拒绝删除 (HRESULT ?)" for all of them. A single delete only
+                # worked by luck (1-element member enumeration unwraps to the
+                # string). Same family as the ConvertFrom-Json '[]' -> $null trap
+                # in the devices action below.
+                $parsed = $diagJson | ConvertFrom-Json
+                foreach ($d in @($parsed)) { $diag[[string]$d.oid] = $d }
             } catch { Write-Log "wpd delete failed: $($_.Exception.Message)" }
         }
 
@@ -1189,13 +1455,21 @@ switch ($Action) {
         $results = @()
         foreach ($it in $items) {
             if (-not $it.oid) { $results += @{ id = $it.id; ok = $false; error = 'no object id' }; continue }
-            $d = $diag[$it.oid]
+            $d = $diag[[string]$it.oid]
             $gone = ($null -ne $d) -and (-not $d.exists)
             if ($gone) {
                 $results += @{ id = $it.id; ok = $true; error = $null }
             } else {
-                $hrHex = if ($d -and $d.hr) { ('0x{0:X8}' -f ([int64]$d.hr -band 0xFFFFFFFF)) } else { '?' }
-                $results += @{ id = $it.id; ok = $false; error = "设备拒绝删除 (HRESULT $hrHex)" }
+                # The file is still on the phone. Say WHY as precisely as the
+                # device let us know — hr 0 means it claimed success and kept the
+                # file anyway, which is a different problem from a refusal.
+                # ($null -ne, not truthiness: hr = 0 is S_OK, and 0 is falsy.)
+                $why =
+                    if ($null -eq $d) { '设备没有返回该文件的删除结果' }
+                    elseif ($null -eq $d.hr) { '设备没有回报删除结果，且文件仍在手机上' }
+                    elseif ([int64]$d.hr -eq 0) { '设备报告删除成功，但文件仍在手机上（可能被相册/图库应用占用）' }
+                    else { '设备拒绝删除 (HRESULT 0x{0:X8})' -f ([int64]$d.hr -band 0xFFFFFFFF) }
+                $results += @{ id = $it.id; ok = $false; error = $why }
             }
         }
         Emit @{ ok = $true; results = @($results) }

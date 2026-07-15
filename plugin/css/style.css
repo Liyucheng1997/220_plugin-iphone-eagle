@@ -167,6 +167,52 @@ input::placeholder { color: var(--text-dim); }
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
+/* ---------- drag ghost ----------
+   Shown only while an original is still being pulled off the phone. Once the
+   file is local, Eagle/the OS takes over with its own drag image. */
+.tile.dragging { opacity: .4; }
+.drag-ghost {
+    position: fixed; z-index: 9999; pointer-events: none;
+    width: 104px; height: 104px;
+    border-radius: 10px; border: 2px solid var(--accent);
+    background: var(--panel-2);
+    box-shadow: 0 14px 30px rgba(0, 0, 0, .55);
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(.55);
+    transition: opacity .16s ease, transform .16s cubic-bezier(.2, .9, .3, 1.4);
+}
+.drag-ghost.on {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(-4deg) scale(1);
+}
+.drag-ghost img {
+    width: 100%; height: 100%;
+    object-fit: cover; display: block; border-radius: 8px;
+}
+.drag-ghost .dg-count {
+    position: absolute; top: -9px; right: -9px;
+    min-width: 22px; height: 22px; padding: 0 6px;
+    border-radius: 11px; background: var(--accent);
+    color: #fff; font-size: 12px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, .5);
+}
+/* Indeterminate: the phone reports no progress for a single file. */
+.drag-ghost .dg-bar {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 3px;
+    background: rgba(255, 255, 255, .18);
+    overflow: hidden; border-radius: 0 0 8px 8px;
+}
+.drag-ghost .dg-bar i {
+    display: block; height: 100%; width: 34%;
+    background: var(--accent);
+    animation: dg-slide .9s linear infinite;
+}
+@keyframes dg-slide {
+    0%   { transform: translateX(-110%); }
+    100% { transform: translateX(400%); }
+}
+
 /* ---------- empty ---------- */
 .empty {
     position: absolute; inset: 0;

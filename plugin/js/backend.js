@@ -39,6 +39,14 @@ function cacheBase() { if (!CACHE_BASE) setBase(null); return CACHE_BASE; }
 // onProgress(count) is called live as the backend prints "PROGRESS <n>" on stderr.
 // opts.idleMs: if set, abort when the backend produces no output for that long
 // (a wedged/locked device blocks silently — better to fail with advice than hang).
+//
+// Killing the child is a LAST resort, not a cheap one: TerminateProcess does not
+// run the backend's finally blocks, so the MTP session is never closed and the
+// driver holds it until it times out — which makes the *next* read hang too, and
+// that read gets killed as well. One spurious timeout can spiral into "every
+// refresh times out until you replug". So the backend heartbeats on stderr
+// through every long step, and these timeouts are deliberately generous: only a
+// genuinely wedged device should ever trip them.
 function runAction(action, opts = {}, onProgress) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -168,9 +176,12 @@ module.exports = {
   },
 
   // Delete from the device. items: [{id, oid}]. Returns { ok, results:[{id,ok,error}] }
+  // content.Delete() is a single blocking call that can't be interrupted or
+  // heartbeat through, and a big selection makes it slow. Killing it half-way is
+  // exactly what wedges the device, so the window here is wide on purpose.
   remove: (device, items) => {
     const inputFile = writeIdsFile(items);
-    return runAction('delete', { device, inputFile, idleMs: 40000 })
+    return runAction('delete', { device, inputFile, idleMs: 120000 })
       .finally(() => cleanup(inputFile));
   },
 };
