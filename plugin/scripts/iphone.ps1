@@ -719,6 +719,10 @@ public static class Wpd
     static IPortableDevicePropertiesBulk _bulk;   // null = device has no bulk support
     static bool _bulkOk;
     static int _bulkFails;
+    // Where the scan's time actually went. Printed at the end of every list, so a
+    // slow read can be diagnosed from a user's log instead of guessed at.
+    static int _viaBulk, _viaPerObject;
+    static long _msBulk, _msPerObject;
 
     // Collects the values WPD hands back on its own worker thread. Results are
     // keyed by object id because the device may return them in any order and may
@@ -792,15 +796,19 @@ public static class Wpd
         // of failures on real folders avoids disabling the fast path over one
         // hiccup.
         if(_bulk != null && _bulkOk && oids.Count >= 8){
+            var t0 = DateTime.UtcNow;
             var m = FetchBulk(keys, oids);
+            _msBulk += (long)(DateTime.UtcNow - t0).TotalMilliseconds;
             if(m != null && m.Count > 0){
                 foreach(var kv in m) map[kv.Key] = kv.Value;
+                _viaBulk += m.Count;
                 if(map.Count >= oids.Count) return map;   // complete; done in one transaction
             } else if(++_bulkFails >= 2){
                 _bulkOk = false;   // device won't serve it — stop paying for the attempt
                 Console.Error.WriteLine("BULK unsupported on this device; using per-object reads");
             }
         }
+        var t1 = DateTime.UtcNow;
         // Per-object fallback: whole folder if bulk is unavailable, otherwise just
         // the stragglers the device left out.
         foreach(var oid in oids){
@@ -816,7 +824,9 @@ public static class Wpd
             // progressively stall (rate collapses ~200x after a few thousand).
             try { Marshal.FinalReleaseComObject(vals); } catch {}
             map[oid] = new ObjInfo { Name = nm, Ct = ct };
+            _viaPerObject++;
         }
+        _msPerObject += (long)(DateTime.UtcNow - t1).TotalMilliseconds;
         return map;
     }
 
@@ -1058,9 +1068,12 @@ public static class Wpd
 
             _sb = new StringBuilder(1<<20); _sb.Append('[');
             _first=true; _count=0; _media=0; _max=maxCount;
+            _viaBulk=0; _viaPerObject=0; _msBulk=0; _msPerObject=0;
             Walk(content, props, keys, "DEVICE", "", true);
             _sb.Append(']');
             LastCount = _media;
+            Console.Error.WriteLine("timing: bulk " + _viaBulk + " objs in " + _msBulk + "ms"
+                + " | per-object " + _viaPerObject + " objs in " + _msPerObject + "ms");
         } finally {
             _bulk = null;
             Rel(keys); Rel(props); Rel(content);
