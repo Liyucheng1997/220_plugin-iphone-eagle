@@ -169,9 +169,13 @@ module.exports = {
 
   // Copy originals to a destination folder. items: [{id, oid, name}].
   // Returns { ok, results:[{id,name,path,ok,error}] }
+  // idleMs is safe here: the backend logs each file AND heartbeats every ~32MB
+  // during a single large transfer, so only a genuinely wedged device trips it.
+  // Without this watchdog, an import attempted on a wedged MTP session (e.g.
+  // after a killed delete) hangs the UI forever.
   copy: (device, items, dest, onProgress) => {
     const inputFile = writeIdsFile(items);
-    return runAction('copy', { device, inputFile, dest }, onProgress)
+    return runAction('copy', { device, inputFile, dest, idleMs: 120000 }, onProgress)
       .finally(() => cleanup(inputFile));
   },
 

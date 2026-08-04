@@ -490,12 +490,27 @@ async function importItems(items, { offerDelete = false, folderId = '' } = {}) {
   const importedSet = loadImported(state.device);
   const okIds = [];
   setBusy(true); showProgress(0);
-  let imported = 0, failed = 0; const batchSize = 12;
+  let imported = 0, failed = 0, firstErr = ''; const batchSize = 12;
+  const noteErr = (msg) => { if (!firstErr && msg) firstErr = String(msg); };
   try {
     for (let i = 0; i < items.length; i += batchSize) {
       const batch = items.slice(i, i + batchSize);
       setStatus(`正在导入 ${i + 1}–${Math.min(i + batch.length, items.length)} / ${items.length}…`);
-      const res = await deviceOp(() => backend.copy(state.device, batch, tempDir));
+      let res;
+      try { res = await deviceOp(() => backend.copy(state.device, batch, tempDir)); }
+      catch (e) {
+        if (e && e.code === 'IDLE_TIMEOUT') {
+          // Device is wedged — every further batch would burn the full watchdog
+          // window the same way. Fail the rest and tell the user how to recover.
+          failed += items.length - i;
+          noteErr('设备无响应。请拔插数据线、保持手机解锁，然后重试');
+          break;
+        }
+        failed += batch.length; noteErr(e.message); continue;
+      }
+      // The backend can fail the whole batch (e.g. WPD unavailable, device not
+      // found) — that comes back as {ok:false, error} with NO results array.
+      if (res.ok === false) { failed += batch.length; noteErr(res.error || '后端拷贝失败（无详细信息）'); continue; }
       for (const r of (res.results || [])) {
         if (r.ok && r.path) {
           try {
@@ -504,15 +519,21 @@ async function importItems(items, { offerDelete = false, folderId = '' } = {}) {
               tags: [SYNC_TAG], folders: folderId ? [folderId] : [], annotation: `来自手机「${state.device}」：` + r.id,
             });
             imported++; importedSet.add(r.id); okIds.push(r.id);
-          } catch (e) { failed++; }
+          } catch (e) { failed++; noteErr('Eagle 入库失败：' + e.message); }
           try { nodeFs.unlinkSync(r.path); } catch (_) {}
-        } else failed++;
+        } else { failed++; noteErr(r.error); }
       }
       saveImported(state.device, importedSet);
       showProgress(Math.round(((i + batch.length) / items.length) * 100));
     }
   } finally { try { nodeFs.rmdirSync(tempDir, { recursive: true }); } catch (_) {} hideProgress(); setBusy(false); }
-  setStatus(`导入完成：成功 ${imported}${failed ? `，失败 ${failed}` : ''}`);
+  setStatus(`导入完成：成功 ${imported}${failed ? `，失败 ${failed}` : ''}${firstErr ? `（${firstErr}）` : ''}`, failed > 0 && imported === 0);
+  if (imported === 0 && failed > 0) {
+    await showInfo('导入失败', `${failed} 个文件都没有导入成功。`,
+      (firstErr ? ('原因：' + firstErr + '\n\n') : '') +
+      '常见原因：照片仅存于 iCloud（手机上打开该照片加载原图后重试）；' +
+      '设备连接后未在手机上点「信任/允许」；或换根数据线/USB 口后重试。');
+  }
   if (offerDelete && okIds.length > 0) {
     const resp = await showConfirm({
       title: '导入完成', message: `已成功导入 ${okIds.length} 张到 Eagle。`,
@@ -561,18 +582,26 @@ async function doBackup() {
   if (dlg.canceled || !dlg.filePaths || !dlg.filePaths.length) return;
   const dest = dlg.filePaths[0];
   setBusy(true); showProgress(0);
-  let ok = 0, failed = 0; const batchSize = 12;
+  let ok = 0, failed = 0, firstErr = ''; const batchSize = 12;
+  const noteErr = (msg) => { if (!firstErr && msg) firstErr = String(msg); };
   try {
     for (let i = 0; i < items.length; i += batchSize) {
       const batch = items.slice(i, i + batchSize);
       setStatus(`正在备份 ${i + 1}–${Math.min(i + batch.length, items.length)} / ${items.length}…`);
-      const res = await deviceOp(() => backend.copy(state.device, batch, dest));
-      for (const r of (res.results || [])) { if (r.ok) ok++; else failed++; }
+      let res;
+      try { res = await deviceOp(() => backend.copy(state.device, batch, dest)); }
+      catch (e) { failed += batch.length; noteErr(e.message); continue; }
+      if (res.ok === false) { failed += batch.length; noteErr(res.error || '后端拷贝失败（无详细信息）'); continue; }
+      for (const r of (res.results || [])) { if (r.ok) ok++; else { failed++; noteErr(r.error); } }
       showProgress(Math.round(((i + batch.length) / items.length) * 100));
     }
   } finally { hideProgress(); setBusy(false); }
-  setStatus(`备份完成：成功 ${ok}${failed ? `，失败 ${failed}` : ''} → ${dest}`);
-  await showInfo('备份完成', `已备份 ${ok} 个文件到：`, dest);
+  setStatus(`备份完成：成功 ${ok}${failed ? `，失败 ${failed}` : ''} → ${dest}`, failed > 0 && ok === 0);
+  if (ok === 0 && failed > 0) {
+    await showInfo('备份失败', `${failed} 个文件都没有备份成功。`, firstErr ? ('原因：' + firstErr) : '');
+  } else {
+    await showInfo('备份完成', `已备份 ${ok} 个文件到：`, dest + (firstErr ? `\n（${failed} 个失败：${firstErr}）` : ''));
+  }
 }
 
 // ---------------------------------------------------------------
@@ -597,7 +626,16 @@ async function removeItems(items, confirmed) {
       if (r.ok) { ok++; removeItemFromState(r.id); }
       else { failed++; if (!firstErr && r.error) firstErr = r.error; }
     }
-  } catch (e) { setStatus('删除出错：' + e.message, true); }
+  } catch (e) {
+    hideProgress(); setBusy(false);
+    if (e && e.code === 'IDLE_TIMEOUT') {
+      setStatus('删除超时：设备无响应', true);
+      await showInfo('删除超时', '手机对删除请求没有响应，连接可能已经卡住。',
+        '请：拔掉数据线再重新插上 → 保持手机解锁 → 点「刷新」。之后照片如果还在，可重试删除或在手机上手动删除。');
+    } else { setStatus('删除出错：' + e.message, true); }
+    state.selected.clear(); applyView();
+    return;
+  }
   finally { hideProgress(); setBusy(false); }
   state.selected.clear(); applyView();
   setStatus(`删除完成：成功 ${ok}${failed ? `，失败 ${failed}` : ''}`);

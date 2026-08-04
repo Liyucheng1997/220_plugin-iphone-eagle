@@ -845,7 +845,14 @@ public static class Wpd
             res.GetStream(oid, ref key, 0, ref optimal, out stream);
             using(var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write)){
                 var buf = new byte[optimal>0?(int)optimal:262144]; IntPtr pcb=Marshal.AllocHGlobal(4); total=0;
-                while(true){ stream.Read(buf, buf.Length, pcb); int r=Marshal.ReadInt32(pcb); if(r<=0) break; fs.Write(buf,0,r); total+=r; }
+                // Heartbeat every ~32MB so the caller's idle watchdog can tell a
+                // long-but-alive transfer (multi-GB video) from a wedged device.
+                long lastBeat = 0;
+                while(true){
+                    stream.Read(buf, buf.Length, pcb); int r=Marshal.ReadInt32(pcb); if(r<=0) break;
+                    fs.Write(buf,0,r); total+=r;
+                    if(total - lastBeat >= 33554432){ lastBeat = total; Console.Error.WriteLine("XFER " + total); }
+                }
                 Marshal.FreeHGlobal(pcb);
             }
             Rel(stream);
