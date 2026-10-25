@@ -20,3 +20,7 @@ _*.html
 
 # Eagle packaged plugin (built artifact; shipped via GitHub Releases)
 *.eagleplugin
+
+# Build output
+dist/
+*.part

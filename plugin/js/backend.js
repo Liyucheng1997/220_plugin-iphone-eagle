@@ -1,191 +1,333 @@
 /*
- * backend.js — Node bridge between the Eagle plugin UI and the phone backend
- * (scripts/iphone.ps1 — handles iPhone AND Android over WPD/MTP; filename kept
- * for backward compatibility). Spawns PowerShell, passes item ids through temp
- * JSON files, parses the single JSON object the script prints on stdout.
+ * backend.js — Node client for bridge/PhoneBridge (the long-lived phone backend).
+ *
+ * One helper process per plugin window, started once and kept alive. Requests
+ * are JSON lines on its stdin; replies and progress events come back as JSON
+ * lines on stdout, routed here by request id. The helper owns the device and
+ * schedules work by priority, so callers simply fire requests and may cancel
+ * them — nothing on this side needs to serialize device access any more.
+ *
+ * Launch order: the prebuilt PhoneBridge.exe, then (if an antivirus or policy
+ * blocks unknown executables) PowerShell compiling the same C# source with
+ * Add-Type. -EncodedCommand is used for the fallback because it is exempt from
+ * the script execution policy and carries non-ASCII paths intact.
  */
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { EventEmitter } = require('events');
 
-const SCRIPT = path.join(__dirname, '..', 'scripts', 'iphone.ps1');
+const BRIDGE_DIR = path.join(__dirname, '..', 'bridge');
+const EXE = path.join(BRIDGE_DIR, 'PhoneBridge.exe');
+const SRC = path.join(BRIDGE_DIR, 'PhoneBridge.cs');
 
-// All temp files/dirs must live under an ASCII, all-users-writable path.
-// os.tmpdir() lives under the user profile, so a non-ASCII Windows username
-// (e.g. "魏培") produces a path that gets mangled when passed as a PowerShell
-// argument — which silently breaks thumbnails/preview/copy (but not listing).
+// ---------------------------------------------------------------------------
+// Cache location. Thumbnails, previews and import staging live here. Prefer a
+// folder next to the plugin; fall back to all-users locations, then tmpdir.
+// (Paths reach the helper as JSON, so non-ASCII folders are fine now.)
+// ---------------------------------------------------------------------------
 let CACHE_BASE = null;
 function tryDir(d) {
-  // eslint-disable-next-line no-control-regex
-  if (!d || /[^\x00-\x7F]/.test(d)) return null;   // must be pure ASCII
+  if (!d) return null;
   try { fs.mkdirSync(d, { recursive: true }); fs.accessSync(d, fs.constants.W_OK); return d; } catch (_) { return null; }
 }
-// Choose an ASCII, writable cache base. Prefer a folder next to the plugin
-// (per user request), then C:\Users\Public, then ProgramData, then tmpdir.
 function setBase(pluginPath) {
   const cands = [];
   if (pluginPath) cands.push(path.join(pluginPath, '.cache'));
+  if (process.env.LOCALAPPDATA) cands.push(path.join(process.env.LOCALAPPDATA, 'EaglePhoneSync'));
   if (process.env.PUBLIC) cands.push(path.join(process.env.PUBLIC, 'eagle-iphone-sync'));
-  if (process.env.ProgramData) cands.push(path.join(process.env.ProgramData, 'eagle-iphone-sync'));
-  cands.push(path.join(os.tmpdir(), 'eagle-iphone-sync'));
+  cands.push(path.join(os.tmpdir(), 'eagle-phone-sync'));
   for (const c of cands) { const r = tryDir(c); if (r) { CACHE_BASE = r; return r; } }
-  CACHE_BASE = path.join(os.tmpdir(), 'eagle-iphone-sync');   // last resort
-  try { fs.mkdirSync(CACHE_BASE, { recursive: true }); } catch (_) {}
+  CACHE_BASE = path.join(os.tmpdir(), 'eagle-phone-sync');
   return CACHE_BASE;
 }
 function cacheBase() { if (!CACHE_BASE) setBase(null); return CACHE_BASE; }
 
-// onProgress(count) is called live as the backend prints "PROGRESS <n>" on stderr.
-// opts.idleMs: if set, abort when the backend produces no output for that long
-// (a wedged/locked device blocks silently — better to fail with advice than hang).
-//
-// Killing the child is a LAST resort, not a cheap one: TerminateProcess does not
-// run the backend's finally blocks, so the MTP session is never closed and the
-// driver holds it until it times out — which makes the *next* read hang too, and
-// that read gets killed as well. One spurious timeout can spiral into "every
-// refresh times out until you replug". So the backend heartbeats on stderr
-// through every long step, and these timeouts are deliberately generous: only a
-// genuinely wedged device should ever trip them.
-function runAction(action, opts = {}, onProgress) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-      '-File', SCRIPT, '-Action', action,
-    ];
-    if (opts.device) args.push('-Device', opts.device);
-    if (opts.inputFile) args.push('-InputFile', opts.inputFile);
-    if (opts.dest) args.push('-Dest', opts.dest);
-    if (opts.outDir) args.push('-OutDir', opts.outDir);
-    if (opts.size) args.push('-Size', String(opts.size));
-    if (opts.max) args.push('-Max', String(opts.max));
+// ---------------------------------------------------------------------------
+// Log file (rotated at 2 MB). Everything the helper prints on stderr lands here,
+// so a problem on someone else's computer can be diagnosed from one file.
+// ---------------------------------------------------------------------------
+let logPath = null;
+function logFile() {
+  if (logPath) return logPath;
+  const dir = path.join(cacheBase(), 'logs');
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+  logPath = path.join(dir, 'bridge.log');
+  try {
+    const st = fs.statSync(logPath);
+    if (st.size > 2 * 1024 * 1024) { try { fs.renameSync(logPath, logPath + '.1'); } catch (_) {} }
+  } catch (_) {}
+  return logPath;
+}
+function log(line) {
+  const d = new Date(), p = (n, w = 2) => String(n).padStart(w, '0');
+  const ts = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+  try { fs.appendFileSync(logFile(), `${ts} ${line}\n`); } catch (_) {}
+}
+function readLogTail(maxBytes = 24000) {
+  try {
+    const p = logFile(); const st = fs.statSync(p);
+    const fd = fs.openSync(p, 'r'); const len = Math.min(st.size, maxBytes);
+    const buf = Buffer.alloc(len); fs.readSync(fd, buf, 0, len, st.size - len); fs.closeSync(fd);
+    return buf.toString('utf8');
+  } catch (_) { return ''; }
+}
 
-    let child;
-    try {
-      child = spawn('powershell.exe', args, { windowsHide: true });
-    } catch (e) { return reject(e); }
+// An error carrying the helper's stable code (NO_DEVICE, ACCESS_DENIED, ...).
+class BridgeError extends Error {
+  constructor(code, message) { super(message || code); this.code = code; }
+}
 
-    let out = '';
-    let errTail = '';
-    let errLineBuf = '';
-    let settled = false;
-    let idleTimer = null;
+// ---------------------------------------------------------------------------
+// Bridge process
+// ---------------------------------------------------------------------------
+class Bridge extends EventEmitter {
+  constructor() {
+    super();
+    this.child = null;
+    this.mode = null;          // 'exe' | 'ps'
+    this.info = null;          // the helper's "ready" message
+    this.ready = null;         // Promise<void> while starting/running
+    this.nextId = 1;
+    this.pending = new Map();  // id -> {resolve, reject, onEvent, op}
+    this.restarts = [];
+    this.disposed = false;
+    this.exeBlocked = false;   // the exe could not run at all → use PowerShell from now on
+    this.lastStartError = '';
+  }
 
-    const finish = (fn, arg) => {
-      if (settled) return;
-      settled = true;
-      if (idleTimer) clearTimeout(idleTimer);
-      fn(arg);
-    };
-    const armIdle = () => {
-      if (!opts.idleMs) return;
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        try { child.kill(); } catch (_) {}
-        const err = new Error('IDLE_TIMEOUT');
-        err.code = 'IDLE_TIMEOUT';
-        finish(reject, err);
-      }, opts.idleMs);
-    };
+  start() {
+    if (this.disposed) return Promise.reject(new BridgeError('CANCELLED', 'plugin closing'));
+    if (this.ready) return this.ready;
+    this.ready = this._startAny().catch((e) => { this.ready = null; throw e; });
+    return this.ready;
+  }
 
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-
-    child.stdout.on('data', (d) => { out += d; armIdle(); });
-    child.stderr.on('data', (d) => {
-      errTail = (errTail + d).slice(-2000);
-      errLineBuf += d;
-      armIdle();
-      let idx;
-      while ((idx = errLineBuf.indexOf('\n')) >= 0) {
-        const line = errLineBuf.slice(0, idx).trim();
-        errLineBuf = errLineBuf.slice(idx + 1);
-        if (onProgress && line.startsWith('PROGRESS ')) {
-          const n = parseInt(line.slice(9).trim(), 10);
-          if (!isNaN(n)) onProgress(n);
-        }
+  async _startAny() {
+    const attempts = [];
+    if (!this.exeBlocked && fs.existsSync(EXE)) attempts.push('exe');
+    attempts.push('ps');
+    let lastErr = null;
+    for (const mode of attempts) {
+      try { await this._spawn(mode); return; }
+      catch (e) {
+        lastErr = e;
+        log(`start (${mode}) failed: ${e.message}`);
+        // Only a hard failure (blocked, crashed) sticks. A slow first start —
+        // typically an antivirus scanning the new exe — falls back to
+        // PowerShell this once and tries the exe again next time.
+        if (mode === 'exe' && e.hard) this.exeBlocked = true;
       }
-    });
+    }
+    this.lastStartError = lastErr ? lastErr.message : 'unknown';
+    throw new BridgeError('BRIDGE_START_FAILED', this.lastStartError);
+  }
 
-    child.on('error', (e) => finish(reject, e));
-    child.on('close', () => {
-      const text = out.trim();
-      if (!text) {
-        return finish(reject, new Error(errTail.trim() || 'no output from backend'));
-      }
-      const lastLine = text.split(/\r?\n/).filter(Boolean).pop();
+  _spawn(mode) {
+    return new Promise((resolve, reject) => {
+      let child;
+      const args = ['--parent', String(process.pid)];
+      const fail = (msg, hard) => { const e = new Error(msg); e.hard = hard; return e; };
       try {
-        finish(resolve, JSON.parse(lastLine));
-      } catch (e) {
-        finish(reject, new Error('could not parse backend output: ' + lastLine));
-      }
+        if (mode === 'exe') {
+          child = spawn(EXE, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+        } else {
+          const lit = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+          const script = [
+            "$ErrorActionPreference = 'Stop'",
+            `$src = [IO.File]::ReadAllText(${lit(SRC)})`,
+            'Add-Type -TypeDefinition $src -ReferencedAssemblies System.Drawing, System.Web.Extensions, System.Management',
+            `[PhoneBridge.Host]::Run(@(${args.map(lit).join(',')}, '--ps'))`,
+          ].join('; ');
+          const enc = Buffer.from(script, 'utf16le').toString('base64');
+          child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', enc],
+            { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+        }
+      } catch (e) { e.hard = true; return reject(e); }
+
+      let settled = false, errTail = '';
+      const startTimer = setTimeout(() => {
+        if (settled) return; settled = true;
+        try { child.kill(); } catch (_) {}
+        reject(fail(`no ready signal from ${mode} helper` + (errTail ? ': ' + errTail.slice(-400) : ''), false));
+      }, mode === 'exe' ? 20000 : 45000);
+
+      let buf = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (d) => {
+        buf += d;
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if (!line) continue;
+          let msg; try { msg = JSON.parse(line); } catch (_) { log('bad line: ' + line.slice(0, 300)); continue; }
+          if (msg.type === 'ready' && !settled) {
+            settled = true; clearTimeout(startTimer);
+            if (this.disposed) { try { child.stdin.end(); } catch (_) {} reject(fail('plugin closing', false)); return; }
+            this.child = child; this.mode = mode; this.info = msg;
+            log(`bridge ready: ${mode} v${msg.version} pid ${msg.pid} clr ${msg.clr} ${msg.x64 ? 'x64' : 'x86'} · ${msg.os || ''}`);
+            resolve();
+            continue;
+          }
+          if (this.child !== child) continue;   // a helper we already replaced
+          this._onMessage(msg);
+        }
+      });
+      let errBuf = '';
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (d) => {
+        errTail = (errTail + d).slice(-2000);
+        errBuf += d;
+        let i;
+        while ((i = errBuf.indexOf('\n')) >= 0) {
+          const line = errBuf.slice(0, i).replace(/\r$/, ''); errBuf = errBuf.slice(i + 1);
+          if (line && !line.startsWith('#< CLIXML') && !line.startsWith('<Objs')) log('[helper] ' + line);
+        }
+      });
+      child.stdin.on('error', () => {});   // EPIPE after the helper died — handled by 'close'
+      child.on('error', (e) => {
+        if (!settled) { settled = true; clearTimeout(startTimer); e.hard = true; reject(e); }
+      });
+      // 'close', not 'exit': it fires only after stdout is drained, so a final
+      // "done" line is never lost.
+      child.on('close', (code, sig) => {
+        if (!settled) { settled = true; clearTimeout(startTimer); reject(fail(`helper exited (${code}) before ready` + (errTail ? ': ' + errTail.slice(-400) : ''), true)); return; }
+        if (this.child !== child) return;
+        log(`bridge exited code=${code} sig=${sig}`);
+        this.child = null; this.ready = null; this.info = null;
+        this._rejectAll(new BridgeError('BRIDGE_EXIT', '后台进程已退出'));
+        if (!this.disposed) this.emit('exit', code);
+      });
     });
+  }
 
-    armIdle(); // start the watchdog
-  });
+  // Every request that will never get its "done" is settled here, and says
+  // so ('settled'), so nothing in the UI waits on it forever.
+  _rejectAll(err) {
+    const all = Array.from(this.pending.entries());
+    this.pending.clear();
+    for (const [id, p] of all) { this.emit('settled', id); p.reject(err); }
+  }
+
+  _onMessage(msg) {
+    if (msg.type === 'stall' || msg.type === 'unstall') { this.emit(msg.type, msg); return; }
+    if (msg.type === 'fatal') {
+      log('bridge fatal: ' + msg.code + ' — restarting helper');
+      this.emit('fatal', msg);
+      this.restart('fatal ' + msg.code);
+      return;
+    }
+    const p = this.pending.get(msg.id);
+    if (!p) return;
+    if (msg.type === 'done') {
+      this.pending.delete(msg.id);
+      this.emit('settled', msg.id);
+      if (msg.ok) p.resolve(msg);
+      else p.reject(new BridgeError(msg.code || 'ERROR', msg.error || msg.code));
+      return;
+    }
+    if (p.onEvent) { try { p.onEvent(msg); } catch (e) { log('event handler threw: ' + e.message); } }
+  }
+
+  // Fire a request. Returns { id, promise, cancel }. The promise resolves with
+  // the helper's "done" message and rejects with a BridgeError.
+  request(op, args = {}, onEvent) {
+    const id = this.nextId++;
+    let cancelled = false;
+    const promise = (async () => {
+      await this.start();
+      if (cancelled) throw new BridgeError('CANCELLED', 'cancelled');
+      // The helper may have been restarted or closed between start() resolving
+      // and this continuation running; a request written nowhere would hang.
+      if (this.disposed) throw new BridgeError('CANCELLED', 'plugin closing');
+      if (!this.child) throw new BridgeError('BRIDGE_RESTART', '后台进程已重启');
+      return new Promise((resolve, reject) => {
+        this.pending.set(id, { resolve, reject, onEvent, op });
+        if (!this._write({ ...args, id, op })) {
+          this.pending.delete(id);
+          reject(new BridgeError('BRIDGE_EXIT', '无法连接后台进程'));
+        }
+      });
+    })();
+    const cancel = () => {
+      if (cancelled) return;
+      cancelled = true;
+      if (this.pending.has(id)) this._write({ id: 0, op: 'cancel', target: id });
+    };
+    promise.catch(() => {});   // callers that only fire-and-forget must not trigger unhandled rejections
+    return { id, promise, cancel };
+  }
+
+  call(op, args, onEvent) { return this.request(op, args, onEvent).promise; }
+
+  _write(obj) {
+    if (!this.child) return false;
+    try { this.child.stdin.write(JSON.stringify(obj) + '\n'); return true; }
+    catch (e) { log('write failed: ' + e.message); return false; }
+  }
+
+  // Last resort for a helper whose worker is wedged inside a driver call. The
+  // old helper is asked to quit (it closes its session on stdin EOF) and only
+  // killed if it hasn't gone after its own shutdown window.
+  restart(why) {
+    const now = Date.now();
+    this.restarts = this.restarts.filter((t) => now - t < 60000);
+    this.restarts.push(now);
+    log('restart: ' + why + (this.restarts.length > 3 ? ' (repeated — the phone is probably wedged; replug it)' : ''));
+    const c = this.child;
+    this.child = null; this.ready = null; this.info = null;
+    this._rejectAll(new BridgeError('BRIDGE_RESTART', '后台进程已重启'));
+    if (c) { try { c.stdin.end(); } catch (_) {} setTimeout(() => { try { c.kill(); } catch (_) {} }, 6000); }
+  }
+
+  // Graceful stop: the helper closes the MTP session itself on stdin EOF.
+  dispose() {
+    this.disposed = true;
+    const c = this.child;
+    this.child = null; this.ready = null;
+    this._rejectAll(new BridgeError('CANCELLED', 'plugin closing'));
+    if (!c) return;
+    try { c.stdin.write(JSON.stringify({ id: 0, op: 'quit' }) + '\n'); c.stdin.end(); } catch (_) {}
+    setTimeout(() => { try { c.kill(); } catch (_) {} }, 6000);
+  }
 }
 
-function writeIdsFile(ids) {
-  const p = path.join(cacheBase(), 'ids_' + Date.now() + '_' + Math.random().toString(36).slice(2) + '.json');
-  fs.writeFileSync(p, JSON.stringify(ids), 'utf8');
-  return p;
-}
-
-function cleanup(p) {
-  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch (_) {}
-}
+const bridge = new Bridge();
 
 module.exports = {
   setBase,
   cacheBase,
+  log,
+  readLogTail,
+  logFile,
+  BridgeError,
+  bridge,
+  start: () => bridge.start(),
+  dispose: () => bridge.dispose(),
+  info: () => ({ mode: bridge.mode, ...(bridge.info || {}), startError: bridge.lastStartError }),
 
-  listDevices: () => runAction('devices'),
+  // Cheap: no MTP session. { devices:[{id,name,mfr,desc,kind}], usb? }
+  devices: (usb = true) => bridge.call('devices', { usb }),
 
-  diagnose: (device) => runAction('diagnose', { device }),
+  // Streams { type:'storages' }, { type:'items', items, count }, { type:'progress', count }.
+  list: (device, onEvent) => bridge.request('list', { device }, onEvent),
 
-  listPhotos: (device, max = 0, onProgress) =>
-    runAction('list', { device, max, idleMs: 45000 }, onProgress),
+  // items: [{id, oid, ext, out}] → per-item { type:'item', itemId, thumb }.
+  thumbs: (device, items, size, onEvent) => bridge.request('thumbs', { device, items, size }, onEvent),
 
-  // Lazy size/date for a batch of ids. Returns { ok, results:[{id, size, date}] }
-  meta: (device, ids) => {
-    const inputFile = writeIdsFile(ids);
-    return runAction('meta', { device, inputFile })
-      .finally(() => cleanup(inputFile));
-  },
+  // → { path, kind, date }. prio 'high' for what the user is looking at.
+  preview: (device, item, outBase, prio = 'high', onEvent) =>
+    bridge.request('preview', { device, item, outBase, prio, size: 2048 }, onEvent),
 
-  // items: [{id, oid}]. Returns { ok, results:[{id, thumb}] }
-  thumbs: (device, items, outDir, size = 256) => {
-    const inputFile = writeIdsFile(items);
-    return runAction('thumb', { device, inputFile, outDir, size, idleMs: 25000 })
-      .finally(() => cleanup(inputFile));
-  },
+  // → per-item { type:'item', itemId, ok, path, code, error, date }, { type:'progress', index, bytes, size }.
+  copy: (device, items, dest, { prio = 'low', keepTimes = true } = {}, onEvent) =>
+    bridge.request('copy', { device, items, dest, prio, keepTimes }, onEvent),
 
-  // Big preview for the viewer. item: {id, oid, name}. Returns { ok, path, kind }.
-  preview: (device, item, outDir) => {
-    const inputFile = writeIdsFile([item]);
-    return runAction('preview', { device, inputFile, outDir, idleMs: 60000 })
-      .finally(() => cleanup(inputFile));
-  },
+  // → per-item { type:'item', itemId, ok, code, hr }, final { results, deleted }.
+  remove: (device, items, onEvent) => bridge.request('delete', { device, items }, onEvent),
 
-  // Copy originals to a destination folder. items: [{id, oid, name}].
-  // Returns { ok, results:[{id,name,path,ok,error}] }
-  // idleMs is safe here: the backend logs each file AND heartbeats every ~32MB
-  // during a single large transfer, so only a genuinely wedged device trips it.
-  // Without this watchdog, an import attempted on a wedged MTP session (e.g.
-  // after a killed delete) hangs the UI forever.
-  copy: (device, items, dest, onProgress) => {
-    const inputFile = writeIdsFile(items);
-    return runAction('copy', { device, inputFile, dest, idleMs: 120000 }, onProgress)
-      .finally(() => cleanup(inputFile));
-  },
-
-  // Delete from the device. items: [{id, oid}]. Returns { ok, results:[{id,ok,error}] }
-  // content.Delete() is a single blocking call that can't be interrupted or
-  // heartbeat through, and a big selection makes it slow. Killing it half-way is
-  // exactly what wedges the device, so the window here is wide on purpose.
-  remove: (device, items) => {
-    const inputFile = writeIdsFile(items);
-    return runAction('delete', { device, inputFile, idleMs: 120000 })
-      .finally(() => cleanup(inputFile));
-  },
+  storage: (device) => bridge.call('storage', { device }),
+  diag: (device) => bridge.call('diag', { device: device || '' }),
+  release: () => bridge.call('release', {}),
 };

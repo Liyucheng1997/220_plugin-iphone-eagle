@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,77 +7,98 @@
     <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-    <header class="toolbar">
-        <div class="toolbar-left">
-            <select id="deviceSelect" title="选择设备"></select>
-            <button id="refreshBtn" class="btn">刷新</button>
-            <span id="status" class="status">正在检测设备…</span>
-        </div>
-        <div class="toolbar-right">
-            <div class="segmented" id="filterSeg">
-                <button type="button" class="seg active" data-kind="all">全部</button>
-                <button type="button" class="seg" data-kind="image">图片</button>
-                <button type="button" class="seg" data-kind="video">视频</button>
+    <header class="topbar">
+        <div class="device" id="devicePill" title="当前设备">
+            <span class="device-ico" id="deviceIco"></span>
+            <div class="device-text">
+                <div class="device-name" id="deviceName">正在启动…</div>
+                <div class="device-sub" id="deviceSub"><span class="dot"></span><span id="deviceSubText">请稍候</span></div>
             </div>
-            <select id="sortBy" class="pill-select" title="排序方式">
-                <option value="order-desc">拍摄顺序（新→旧）</option>
-                <option value="order-asc">拍摄顺序（旧→新）</option>
-                <option value="name-asc">文件名</option>
-            </select>
+            <select id="deviceSelect" class="device-select" title="切换设备"></select>
         </div>
+        <button id="refreshBtn" class="icon-btn" title="重新读取 (F5)"></button>
+        <div class="spacer"></div>
+        <div class="seg" id="filterSeg">
+            <button type="button" class="active" data-kind="all">全部</button>
+            <button type="button" data-kind="image">照片</button>
+            <button type="button" data-kind="video">视频</button>
+            <button type="button" data-kind="new">未导入</button>
+        </div>
+        <select id="sortBy" class="pill-select" title="排序">
+            <option value="date-desc">最新在前</option>
+            <option value="date-asc">最早在前</option>
+            <option value="name-asc">按文件名</option>
+        </select>
+        <button id="moreBtn" class="icon-btn" title="更多"></button>
     </header>
 
     <section class="actionbar">
-        <label class="chk"><input type="checkbox" id="selectAll"> 全选</label>
-        <span id="selCount" class="selcount">已选 0 项</span>
+        <label class="check-all"><input type="checkbox" id="selectAll"> 全选</label>
+        <span id="selInfo" class="sel-info tabular"></span>
         <div class="spacer"></div>
-        <button id="importBtn" class="btn btn-primary" disabled>导入所选</button>
-        <button id="deleteBtn" class="btn btn-danger" disabled>删除所选…</button>
+        <div id="selActions" class="sel-actions" hidden>
+            <button id="clearSelBtn" class="btn btn-sm btn-ghost">取消选择</button>
+            <button id="deleteBtn" class="btn btn-sm btn-danger">从手机删除</button>
+            <button id="exportBtn" class="btn btn-sm">导出到文件夹</button>
+        </div>
+        <label class="folder-pick" title="导入到 Eagle 的哪个文件夹">
+            <span>导入到</span>
+            <select id="folderSelect" class="pill-select"><option value="">未分类</option></select>
+        </label>
+        <button id="importBtn" class="btn btn-primary" disabled>导入新照片</button>
     </section>
 
-    <main id="grid" class="grid">
+    <main id="grid" class="grid" tabindex="0">
         <div id="gridInner"></div>
-        <div id="emptyState" class="empty">
-            <div class="empty-icon">📱</div>
-            <p id="emptyText">用数据线连接手机，然后点“刷新”。iPhone：在手机上点“信任”；安卓：下拉通知栏，把 USB 用途改为“传输文件 / MTP”。</p>
-        </div>
+        <div id="marquee" class="marquee" hidden></div>
+        <div id="emptyState" class="empty"></div>
     </main>
 
     <footer class="footer">
-        <span id="footerInfo"></span>
-        <progress id="progress" max="100" value="0" style="display:none"></progress>
+        <span id="status" class="status"></span>
         <div class="zoombar">
-            <button id="zoomOut" class="zbtn" title="缩小缩略图">−</button>
-            <input id="zoomRange" type="range" min="90" max="260" step="10" value="150" title="缩略图大小">
-            <button id="zoomIn" class="zbtn" title="放大缩略图">+</button>
+            <button id="zoomOut" class="icon-btn sm" title="缩小">−</button>
+            <input id="zoomRange" type="range" min="90" max="280" step="10" value="160" title="缩略图大小">
+            <button id="zoomIn" class="icon-btn sm" title="放大">+</button>
         </div>
     </footer>
 
-    <!-- Hover preview (Eagle-style, bottom-right) -->
-    <div id="hoverPreview" class="hover-preview" style="display:none">
+    <!-- Device stopped answering (locked phone, sleeping screen) -->
+    <div id="stallBanner" class="stall-banner" hidden>
+        <span class="spinner sm"></span>
+        <span id="stallText">手机暂时没有响应，请保持手机解锁、屏幕常亮…</span>
+    </div>
+
+    <!-- Background task (import / export / delete) -->
+    <div id="taskPanel" class="task-panel" hidden></div>
+
+    <!-- Hover preview from the magnifier -->
+    <div id="hoverPreview" class="hover-preview" hidden>
         <img id="hoverImg" alt="">
         <div id="hoverName" class="hover-name"></div>
     </div>
 
-    <!-- Full-screen photo viewer -->
-    <div id="viewer" class="viewer" style="display:none">
+    <!-- Viewer -->
+    <div id="viewer" class="viewer" hidden>
         <div class="viewer-topbar">
-            <span id="viewerTitle" class="viewer-title"></span>
+            <div class="viewer-title"><span id="viewerTitle"></span><span id="viewerMeta" class="viewer-meta"></span></div>
             <div class="viewer-actions">
-                <button id="viewerAdd" class="btn btn-primary">添加到未分类</button>
-                <button id="viewerDelete" class="btn btn-danger">从手机删除</button>
-                <button id="viewerClose" class="btn" title="关闭 (Esc)">✕</button>
+                <button id="viewerAdd" class="btn btn-primary btn-sm">添加到 Eagle</button>
+                <button id="viewerDelete" class="btn btn-sm btn-danger-dark">从手机删除</button>
+                <button id="viewerClose" class="viewer-x" title="关闭 (Esc)">✕</button>
             </div>
         </div>
         <button id="viewerPrev" class="viewer-nav prev" title="上一张 (←)">‹</button>
         <div id="viewerStage" class="viewer-stage">
-            <img id="viewerImg" class="viewer-img" alt="" draggable="false">
-            <video id="viewerVideo" class="viewer-img" controls playsinline draggable="false" style="display:none"></video>
+            <img id="viewerImg" class="viewer-media" alt="" draggable="false" hidden>
+            <video id="viewerVideo" class="viewer-media" controls playsinline draggable="false" hidden></video>
             <div id="viewerMsg" class="viewer-msg"></div>
         </div>
         <button id="viewerNext" class="viewer-nav next" title="下一张 (→)">›</button>
-        <div id="viewerCounter" class="viewer-counter"></div>
+        <div id="viewerCounter" class="viewer-counter tabular"></div>
     </div>
+
+    <div id="toastHost" class="toast-host"></div>
 
     <script src="js/app.js"></script>
 </body>
